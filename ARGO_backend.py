@@ -15,6 +15,12 @@ import requests
 import time
 from urllib.parse import quote
 
+# Plotting imports
+import matplotlib.pyplot as plt
+import seaborn as sns
+from io import BytesIO
+import base64
+
 # Suppress warnings
 warnings.filterwarnings("ignore")
 
@@ -37,6 +43,21 @@ except ImportError:
     LANGCHAIN_AVAILABLE = False
     print("Warning: LangChain not installed. Install with: pip install langchain langchain-community faiss-cpu sentence-transformers")
 
+# GPU device detection (MPS for macOS, CUDA for others)
+import torch
+
+def get_device():
+    """Detect and return the best available device (MPS, CUDA, or CPU)"""
+    if torch.backends.mps.is_available():
+        return "mps"
+    elif torch.cuda.is_available():
+        return "cuda"
+    else:
+        return "cpu"
+
+DEVICE = get_device()
+print(f"Using device: {DEVICE}")
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -50,23 +71,36 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class ARGORecord:
-    """Data class for ARGO measurements"""
-    float_id: str
-    date: str
+    """Data class for ARGO measurements - Updated for real dataset"""
+    n_points: int
+    cycle_number: int
+    data_mode: str
+    direction: str
+    platform_number: str
+    position_qc: str
+    pressure: float
+    pres_error: float
+    pres_qc: str
+    salinity: float
+    psal_error: float
+    psal_qc: str
+    temperature: float
+    temp_error: float
+    temp_qc: str
+    time_qc: str
     latitude: float
     longitude: float
-    depth: float
-    temperature: float
-    salinity: float
-    pressure: float
+    date: str
+    region: str
 
 class RAGRetriever:
-    """RAG (Retrieval Augmented Generation) system using LangChain and FAISS"""
+    """RAG (Retrieval Augmented Generation) system using LangChain and FAISS with GPU support"""
     
     def __init__(self, data_dir: str = "."):
         self.data_dir = Path(data_dir)
         self.vector_store = None
         self.embeddings = None
+        self.device = DEVICE
         self.faiss_index_path = self.data_dir / "argo_index.faiss"
         self.metadata_path = self.data_dir / "argo_metadata.pkl"
         
@@ -76,14 +110,18 @@ class RAGRetriever:
             logger.warning("LangChain not available. RAG functionality disabled.")
     
     def _initialize_rag(self):
-        """Initialize RAG system with embeddings and vector store"""
+        """Initialize RAG system with embeddings and vector store using GPU when available"""
         try:
-            # Initialize embeddings model
+            # Initialize embeddings model with GPU support
+            model_kwargs = {'device': self.device} if self.device != 'cpu' else {'device': 'cpu'}
+            
             self.embeddings = HuggingFaceEmbeddings(
                 model_name="all-MiniLM-L6-v2",
-                model_kwargs={'device': 'cpu'},
+                model_kwargs=model_kwargs,
                 encode_kwargs={'normalize_embeddings': True}
             )
+            
+            logger.info(f"Embeddings model initialized on {self.device}")
             
             # Try to load existing FAISS index
             if self.faiss_index_path.exists() and self.metadata_path.exists():
@@ -102,7 +140,7 @@ class RAGRetriever:
             self.vector_store = None
     
     def create_vector_store(self, documents: List[str], metadata: List[Dict]):
-        """Create and save FAISS vector store from documents"""
+        """Create and save FAISS vector store from documents using GPU acceleration"""
         if not LANGCHAIN_AVAILABLE:
             logger.warning("LangChain not available. Cannot create vector store.")
             return False
@@ -116,13 +154,13 @@ class RAGRetriever:
                     metadata=doc_metadata
                 ))
             
-            # Create vector store
-            logger.info(f"Creating FAISS vector store with {len(docs)} documents...")
+            # Create vector store with GPU acceleration
+            logger.info(f"Creating FAISS vector store with {len(docs)} documents on {self.device}...")
             self.vector_store = FAISS.from_documents(docs, self.embeddings)
             
             # Save the vector store
             self.vector_store.save_local(str(self.data_dir), index_name="argo_index")
-            logger.info(f"FAISS vector store created and saved successfully")
+            logger.info(f"FAISS vector store created and saved successfully on {self.device}")
             
             return True
             
@@ -131,13 +169,13 @@ class RAGRetriever:
             return False
     
     def retrieve_relevant_docs(self, query: str, k: int = 5) -> List[Tuple[str, Dict]]:
-        """Retrieve relevant documents using RAG"""
+        """Retrieve relevant documents using RAG with GPU acceleration"""
         if not self.vector_store:
             logger.warning("Vector store not available. Using fallback search.")
             return []
         
         try:
-            # Perform similarity search
+            # Perform similarity search with GPU acceleration
             results = self.vector_store.similarity_search_with_score(query, k=k)
             
             # Format results
@@ -156,6 +194,133 @@ class RAGRetriever:
         """Check if RAG system is available"""
         return LANGCHAIN_AVAILABLE and self.vector_store is not None
 
+class PlottingService:
+    """Service for generating oceanographic plots"""
+    
+    def __init__(self):
+        plt.style.use('seaborn-v0_8' if 'seaborn-v0_8' in plt.style.available else 'default')
+        self.figsize = (10, 8)
+        self.dpi = 100
+    
+    def create_temp_vs_depth_plot(self, df: pd.DataFrame, title: str = "Temperature vs Depth") -> str:
+        """Create temperature vs depth plot"""
+        try:
+            fig, ax = plt.subplots(figsize=self.figsize, dpi=self.dpi)
+            
+            # Filter out invalid data
+            valid_data = df[(df['temperature'].notna()) & (df['pressure'].notna())]
+            
+            if len(valid_data) == 0:
+                return "No valid temperature/depth data available for plotting."
+            
+            # Create scatter plot with color based on temperature
+            scatter = ax.scatter(valid_data['temperature'], valid_data['pressure'], 
+                               c=valid_data['temperature'], cmap='coolwarm', alpha=0.6, s=20)
+            
+            ax.set_xlabel('Temperature (°C)', fontsize=12)
+            ax.set_ylabel('Pressure (dbar)', fontsize=12)
+            ax.set_title(title, fontsize=14, fontweight='bold')
+            ax.invert_yaxis()  # Depth increases downward
+            
+            # Add colorbar
+            cbar = plt.colorbar(scatter, ax=ax)
+            cbar.set_label('Temperature (°C)', fontsize=10)
+            
+            # Add grid
+            ax.grid(True, alpha=0.3)
+            
+            # Save plot to base64 string
+            buffer = BytesIO()
+            plt.savefig(buffer, format='png', bbox_inches='tight', dpi=self.dpi)
+            buffer.seek(0)
+            plot_data = base64.b64encode(buffer.getvalue()).decode()
+            plt.close(fig)
+            
+            return f"Temperature vs Depth plot created successfully. Data points: {len(valid_data)}"
+            
+        except Exception as e:
+            logger.error(f"Error creating temperature vs depth plot: {e}")
+            return f"Error creating plot: {e}"
+    
+    def create_salinity_vs_temp_plot(self, df: pd.DataFrame, title: str = "Salinity vs Temperature") -> str:
+        """Create salinity vs temperature plot"""
+        try:
+            fig, ax = plt.subplots(figsize=self.figsize, dpi=self.dpi)
+            
+            # Filter out invalid data
+            valid_data = df[(df['temperature'].notna()) & (df['salinity'].notna())]
+            
+            if len(valid_data) == 0:
+                return "No valid salinity/temperature data available for plotting."
+            
+            # Create scatter plot with color based on depth (pressure)
+            scatter = ax.scatter(valid_data['temperature'], valid_data['salinity'], 
+                               c=valid_data['pressure'], cmap='viridis', alpha=0.6, s=20)
+            
+            ax.set_xlabel('Temperature (°C)', fontsize=12)
+            ax.set_ylabel('Salinity (PSU)', fontsize=12)
+            ax.set_title(title, fontsize=14, fontweight='bold')
+            
+            # Add colorbar
+            cbar = plt.colorbar(scatter, ax=ax)
+            cbar.set_label('Pressure (dbar)', fontsize=10)
+            
+            # Add grid
+            ax.grid(True, alpha=0.3)
+            
+            # Save plot
+            buffer = BytesIO()
+            plt.savefig(buffer, format='png', bbox_inches='tight', dpi=self.dpi)
+            buffer.seek(0)
+            plot_data = base64.b64encode(buffer.getvalue()).decode()
+            plt.close(fig)
+            
+            return f"Salinity vs Temperature plot created successfully. Data points: {len(valid_data)}"
+            
+        except Exception as e:
+            logger.error(f"Error creating salinity vs temperature plot: {e}")
+            return f"Error creating plot: {e}"
+    
+    def create_salinity_vs_depth_plot(self, df: pd.DataFrame, title: str = "Salinity vs Depth") -> str:
+        """Create salinity vs depth plot"""
+        try:
+            fig, ax = plt.subplots(figsize=self.figsize, dpi=self.dpi)
+            
+            # Filter out invalid data
+            valid_data = df[(df['salinity'].notna()) & (df['pressure'].notna())]
+            
+            if len(valid_data) == 0:
+                return "No valid salinity/depth data available for plotting."
+            
+            # Create scatter plot with color based on salinity
+            scatter = ax.scatter(valid_data['salinity'], valid_data['pressure'], 
+                               c=valid_data['salinity'], cmap='plasma', alpha=0.6, s=20)
+            
+            ax.set_xlabel('Salinity (PSU)', fontsize=12)
+            ax.set_ylabel('Pressure (dbar)', fontsize=12)
+            ax.set_title(title, fontsize=14, fontweight='bold')
+            ax.invert_yaxis()  # Depth increases downward
+            
+            # Add colorbar
+            cbar = plt.colorbar(scatter, ax=ax)
+            cbar.set_label('Salinity (PSU)', fontsize=10)
+            
+            # Add grid
+            ax.grid(True, alpha=0.3)
+            
+            # Save plot
+            buffer = BytesIO()
+            plt.savefig(buffer, format='png', bbox_inches='tight', dpi=self.dpi)
+            buffer.seek(0)
+            plot_data = base64.b64encode(buffer.getvalue()).decode()
+            plt.close(fig)
+            
+            return f"Salinity vs Depth plot created successfully. Data points: {len(valid_data)}"
+            
+        except Exception as e:
+            logger.error(f"Error creating salinity vs depth plot: {e}")
+            return f"Error creating plot: {e}"
+
 class DuckDuckGoSearch:
     """Simple DuckDuckGo search integration"""
     
@@ -166,7 +331,6 @@ class DuckDuckGoSearch:
     def search(self, query: str, max_results: int = 3) -> List[Dict]:
         """Search DuckDuckGo and return results"""
         try:
-            # Use DuckDuckGo Instant Answer API
             params = {
                 'q': query,
                 'format': 'json',
@@ -180,7 +344,6 @@ class DuckDuckGoSearch:
             
             results = []
             
-            # Extract abstract
             if data.get('Abstract'):
                 results.append({
                     'title': data.get('AbstractText', 'DuckDuckGo Result'),
@@ -189,7 +352,6 @@ class DuckDuckGoSearch:
                     'source': 'DuckDuckGo Instant Answer'
                 })
             
-            # Extract related topics
             for topic in data.get('RelatedTopics', [])[:max_results]:
                 if isinstance(topic, dict) and topic.get('Text'):
                     results.append({
@@ -199,12 +361,10 @@ class DuckDuckGoSearch:
                         'source': 'DuckDuckGo Related'
                     })
             
-            # If no results, try a different approach
             if not results:
-                # Fallback: create a generic response
                 results.append({
                     'title': f'Search results for: {query}',
-                    'snippet': f'I searched for "{query}" but couldn\'t find specific instant answers. This may be a complex topic requiring detailed analysis.',
+                    'snippet': f'I searched for "{query}" but couldn\'t find specific instant answers.',
                     'url': f'https://duckduckgo.com/?q={quote(query)}',
                     'source': 'DuckDuckGo Search'
                 })
@@ -249,7 +409,6 @@ class SimpleTextSearch:
                 for doc_idx in self.index[word]:
                     scores[doc_idx] = scores.get(doc_idx, 0) + 1
         
-        # Sort by score and return top k
         sorted_docs = sorted(scores.items(), key=lambda x: x[1], reverse=True)[:k]
         
         results = []
@@ -259,15 +418,16 @@ class SimpleTextSearch:
         return results
 
 class Phi35Model:
-    """Phi-3.5-mini-instruct model wrapper"""
+    """Phi-3.5-mini-instruct model wrapper with GPU support"""
     
     def __init__(self, model_path: str):
         self.model = None
         self.model_path = model_path
+        self.device = DEVICE
         self.load_model()
     
     def load_model(self):
-        """Load the Phi-3.5 model"""
+        """Load the Phi-3.5 model with GPU support"""
         try:
             if not LLAMA_CPP_AVAILABLE:
                 raise ImportError("llama-cpp-python not available")
@@ -276,13 +436,17 @@ class Phi35Model:
             if not model_file.exists():
                 raise FileNotFoundError(f"Model file not found: {model_file}")
             
+            # Configure GPU settings
+            n_gpu_layers = -1 if self.device in ['cuda', 'mps'] else 0
+            
             self.model = Llama(
                 model_path=str(model_file),
-                n_ctx=4096,  # Context window
-                n_threads=4,  # Number of threads
+                n_ctx=4096,
+                n_threads=4,
+                n_gpu_layers=n_gpu_layers,
                 verbose=False
             )
-            logger.info("Phi-3.5 model loaded successfully")
+            logger.info(f"Phi-3.5 model loaded successfully on {self.device}")
             
         except Exception as e:
             logger.error(f"Failed to load Phi-3.5 model: {e}")
@@ -294,7 +458,6 @@ class Phi35Model:
             return "AI model not available. Using fallback response generation."
         
         try:
-            # Format prompt for Phi-3.5-mini-instruct
             formatted_prompt = f"""<|user|>
 {prompt}<|end|>
 <|assistant|>
@@ -315,183 +478,107 @@ class Phi35Model:
             return f"Error generating AI response: {str(e)}"
 
 class EnhancedARGOChatbot:
-    """Enhanced ARGO Chatbot with AI, web search, and RAG capabilities"""
+    """Enhanced ARGO Chatbot with real dataset, GPU support, and plotting capabilities"""
     
     def __init__(self, data_dir: str = ".", models_dir: str = "./models"):
-        """Initialize Enhanced ARGO Chatbot with RAG"""
+        """Initialize Enhanced ARGO Chatbot with real dataset"""
         self.data_dir = Path(data_dir)
         self.models_dir = Path(models_dir)
         self.df = None
         self.db_path = self.data_dir / "argo_data.db"
+        self.csv_path = self.data_dir / "argo_data.csv"  # Real dataset
         self.search_engine = None
         self.web_search = DuckDuckGoSearch()
         self.ai_model = Phi35Model(self.models_dir)
-        self.rag_retriever = RAGRetriever(self.data_dir)  # Initialize RAG system
+        self.rag_retriever = RAGRetriever(self.data_dir)
+        self.plotter = PlottingService()
         
-        logger.info("Starting Enhanced ARGO Chatbot with RAG initialization...")
-        self._load_data()
+        logger.info(f"Starting Enhanced ARGO Chatbot with real dataset on {DEVICE}...")
+        self._load_real_data()
         self._setup_database()
         self._setup_search()
-        self._setup_rag()  # Setup RAG system
-        logger.info("Enhanced ARGO Chatbot with RAG initialized successfully")
+        self._setup_rag()
+        logger.info("Enhanced ARGO Chatbot with real dataset initialized successfully")
     
-    def _setup_rag(self):
-        """Setup RAG system with existing vector store or create new one"""
-        if not LANGCHAIN_AVAILABLE:
-            logger.warning("LangChain not available. RAG functionality disabled.")
-            return
-        
-        # If vector store doesn't exist, create it from current data
-        if not self.rag_retriever.is_available() and self.df is not None:
-            logger.info("Creating RAG vector store from ARGO data...")
-            
-            # Prepare documents for RAG
-            documents = []
-            metadata = []
-            
-            for _, row in self.df.iterrows():
-                # Create rich document content for better RAG retrieval
-                content = f"""
-ARGO Float Scientific Data Record
-Float ID: {row['float_id']}
-Date: {row['date']}
-Geographic Location: Latitude {row['latitude']}° {('N' if row['latitude'] >= 0 else 'S')}, Longitude {row['longitude']}° {('E' if row['longitude'] >= 0 else 'W')}
-Oceanographic Measurements:
-- Water Temperature: {row['temperature']}°C
-- Salinity: {row['salinity']} PSU (Practical Salinity Units)
-- Measurement Depth: {row['depth']} meters below sea surface
-- Water Pressure: {row['pressure']} decibars
-Scientific Context: This measurement was taken by autonomous ARGO float {row['float_id']} as part of the global ocean observation network. ARGO floats provide critical data for understanding ocean circulation, climate patterns, and marine ecosystems. Temperature and salinity measurements at various depths help scientists study water mass properties, thermohaline circulation, and climate change impacts on ocean systems.
-Keywords: oceanography, marine science, temperature profile, salinity profile, ocean circulation, climate monitoring, autonomous float, CTD data, hydrographic survey
-                """.strip()
-                
-                documents.append(content)
-                metadata.append({
-                    'float_id': row['float_id'],
-                    'date': row['date'],
-                    'latitude': float(row['latitude']),
-                    'longitude': float(row['longitude']),
-                    'depth': float(row['depth']),
-                    'temperature': float(row['temperature']),
-                    'salinity': float(row['salinity']),
-                    'pressure': float(row['pressure']),
-                    'doc_type': 'argo_measurement'
-                })
-            
-            # Create vector store
-            success = self.rag_retriever.create_vector_store(documents, metadata)
-            if success:
-                logger.info("RAG vector store created successfully")
-            else:
-                logger.warning("Failed to create RAG vector store")
-    
-    def _load_data(self):
-        """Load ARGO dataset with error handling"""
+    def _load_real_data(self):
+        """Load real ARGO dataset"""
         try:
-            csv_path = self.data_dir / "argo_dummy.csv"
-            if not csv_path.exists():
-                logger.info("Creating dummy ARGO data...")
-                self._create_dummy_data(csv_path)
+            if not self.csv_path.exists():
+                raise FileNotFoundError(f"Real ARGO dataset not found: {self.csv_path}")
             
-            self.df = pd.read_csv(csv_path)
-            # Ensure date column is string for consistency
-            self.df['date'] = pd.to_datetime(self.df['date']).dt.strftime('%Y-%m-%d')
-            logger.info(f"Loaded {len(self.df)} records from ARGO dataset")
+            logger.info("Loading real ARGO dataset...")
+            self.df = pd.read_csv(self.csv_path)
+            
+            # Ensure date column is properly formatted
+            if 'date' in self.df.columns:
+                self.df['date'] = pd.to_datetime(self.df['date'], errors='coerce').dt.strftime('%Y-%m-%d')
+            
+            # Clean numeric columns
+            numeric_columns = ['pressure', 'salinity', 'temperature', 'latitude', 'longitude']
+            for col in numeric_columns:
+                if col in self.df.columns:
+                    self.df[col] = pd.to_numeric(self.df[col], errors='coerce')
+            
+            logger.info(f"Loaded {len(self.df)} records from real ARGO dataset")
+            logger.info(f"Dataset columns: {list(self.df.columns)}")
             
         except Exception as e:
-            logger.error(f"Error loading data: {e}")
-            self._create_dummy_data()
-    
-    def _create_dummy_data(self, csv_path: Optional[Path] = None):
-        """Create realistic dummy ARGO data for testing"""
-        if csv_path is None:
-            csv_path = self.data_dir / "argo_dummy.csv"
-        
-        np.random.seed(42)
-        n_records = 2000  # Increased dataset size
-        
-        # Generate realistic ARGO float data
-        float_ids = [f"ARGO_{i:04d}" for i in range(1000, 1000 + n_records)]
-        
-        # Generate dates over 3 years with seasonal patterns
-        start_date = pd.Timestamp('2021-01-01')
-        dates = pd.date_range(start=start_date, periods=n_records, freq='D')
-        
-        # Generate realistic oceanographic data with patterns
-        latitudes = np.random.uniform(-70, 70, n_records)
-        longitudes = np.random.uniform(-180, 180, n_records)
-        depths = np.random.exponential(200, n_records).clip(5, 2000)
-        
-        # Temperature varies with depth, latitude, and season
-        day_of_year = dates.dayofyear
-        seasonal_temp = 5 * np.sin(2 * np.pi * day_of_year / 365)  # Seasonal variation
-        surface_temps = 20 - 0.5 * np.abs(latitudes) + seasonal_temp + np.random.normal(0, 2, n_records)
-        depth_effect = -depths * 0.015  # Temperature decreases with depth
-        temperatures = (surface_temps + depth_effect + np.random.normal(0, 1, n_records)).clip(-2, 35)
-        
-        # Salinity with realistic oceanic patterns
-        base_salinity = 35 + 0.1 * np.abs(latitudes) * np.random.normal(1, 0.1, n_records)
-        salinities = (base_salinity + np.random.normal(0, 1.5, n_records)).clip(30, 40)
-        
-        # Pressure correlates with depth
-        pressures = depths * 0.1 + np.random.normal(0, 3, n_records)
-        
-        dummy_data = {
-            'float_id': float_ids,
-            'date': dates.strftime('%Y-%m-%d'),
-            'latitude': latitudes.round(4),
-            'longitude': longitudes.round(4),
-            'depth': depths.round(1),
-            'temperature': temperatures.round(2),
-            'salinity': salinities.round(2),
-            'pressure': pressures.round(1)
-        }
-        
-        self.df = pd.DataFrame(dummy_data)
-        self.df.to_csv(csv_path, index=False)
-        logger.info(f"Created realistic dummy ARGO data with {len(self.df)} records")
+            logger.error(f"Error loading real ARGO data: {e}")
+            raise
     
     def _setup_database(self):
-        """Setup SQLite database for fast queries"""
+        """Setup SQLite database for real dataset"""
         try:
             conn = sqlite3.connect(self.db_path)
             cursor = conn.cursor()
             
-            # Create table with indices for better performance
+            # Create table matching real dataset structure
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS argo_data (
                     id INTEGER PRIMARY KEY,
-                    float_id TEXT,
-                    date TEXT,
+                    n_points INTEGER,
+                    cycle_number INTEGER,
+                    data_mode TEXT,
+                    direction TEXT,
+                    platform_number TEXT,
+                    position_qc TEXT,
+                    pressure REAL,
+                    pres_error REAL,
+                    pres_qc TEXT,
+                    salinity REAL,
+                    psal_error REAL,
+                    psal_qc TEXT,
+                    temperature REAL,
+                    temp_error REAL,
+                    temp_qc TEXT,
+                    time_qc TEXT,
                     latitude REAL,
                     longitude REAL,
-                    depth REAL,
-                    temperature REAL,
-                    salinity REAL,
-                    pressure REAL
+                    date TEXT,
+                    region TEXT
                 )
             ''')
             
-            # Create indices for faster queries
-            cursor.execute('CREATE INDEX IF NOT EXISTS idx_float_id ON argo_data(float_id)')
+            # Create indices for better performance
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_platform ON argo_data(platform_number)')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_date ON argo_data(date)')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_location ON argo_data(latitude, longitude)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_region ON argo_data(region)')
             
             # Check if data exists
             cursor.execute('SELECT COUNT(*) FROM argo_data')
             count = cursor.fetchone()[0]
             
             if count == 0:
-                # Insert data
+                # Insert real data
+                columns = list(self.df.columns)
+                placeholders = ','.join(['?' for _ in columns])
+                
                 for _, row in self.df.iterrows():
-                    cursor.execute('''
-                        INSERT INTO argo_data 
-                        (float_id, date, latitude, longitude, depth, temperature, salinity, pressure)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                    ''', (
-                        row['float_id'], row['date'], row['latitude'], row['longitude'],
-                        row['depth'], row['temperature'], row['salinity'], row['pressure']
-                    ))
+                    cursor.execute(f'''
+                        INSERT INTO argo_data ({','.join(columns)})
+                        VALUES ({placeholders})
+                    ''', tuple(row))
                 
                 conn.commit()
                 logger.info(f"Inserted {len(self.df)} records into database")
@@ -505,86 +592,186 @@ Keywords: oceanography, marine science, temperature profile, salinity profile, o
             raise
     
     def _setup_search(self):
-        """Setup simple text search with enhanced content"""
+        """Setup search with real dataset content"""
         try:
             documents = []
             metadata = []
             
             for _, row in self.df.iterrows():
+                # Create rich content for real dataset
                 content = f"""
-ARGO Float {row['float_id']} oceanographic measurement recorded on {row['date']}
-Geographic location: latitude {row['latitude']} degrees, longitude {row['longitude']} degrees
-Ocean profile data: measurement depth {row['depth']} meters, water temperature {row['temperature']} degrees Celsius, 
-ocean salinity {row['salinity']} PSU (Practical Salinity Units), water pressure {row['pressure']} decibars
-Oceanographic conditions from autonomous float {row['float_id']} collected {row['date']} at coordinates {row['latitude']}, {row['longitude']}
-Marine data temperature salinity depth pressure ocean conditions float measurement
+ARGO Platform {row.get('platform_number', 'Unknown')} oceanographic measurement
+Cycle: {row.get('cycle_number', 'N/A')}, Data Mode: {row.get('data_mode', 'N/A')}
+Date: {row.get('date', 'N/A')}, Region: {row.get('region', 'Unknown')}
+Geographic location: latitude {row.get('latitude', 'N/A')} degrees, longitude {row.get('longitude', 'N/A')} degrees
+Oceanographic measurements: pressure {row.get('pressure', 'N/A')} dbar, temperature {row.get('temperature', 'N/A')} degrees Celsius, salinity {row.get('salinity', 'N/A')} PSU
+Quality control: Position QC {row.get('position_qc', 'N/A')}, Pressure QC {row.get('pres_qc', 'N/A')}, Temperature QC {row.get('temp_qc', 'N/A')}, Salinity QC {row.get('psal_qc', 'N/A')}
+Scientific context: ARGO float oceanographic profile data for climate research and ocean monitoring
+Keywords: oceanography marine science CTD profile temperature salinity pressure ocean circulation climate
                 """.strip()
                 
                 documents.append(content)
-                metadata.append({
-                    'float_id': row['float_id'],
-                    'date': row['date'],
-                    'latitude': float(row['latitude']),
-                    'longitude': float(row['longitude']),
-                    'depth': float(row['depth']),
-                    'temperature': float(row['temperature']),
-                    'salinity': float(row['salinity']),
-                    'pressure': float(row['pressure'])
-                })
+                metadata.append({k: v for k, v in row.items() if pd.notna(v)})
             
             self.search_engine = SimpleTextSearch(documents, metadata)
-            logger.info(f"Initialized enhanced search with {len(documents)} documents")
+            logger.info(f"Initialized search with {len(documents)} real dataset documents")
             
         except Exception as e:
             logger.error(f"Error setting up search: {e}")
             raise
     
+    def _setup_rag(self):
+        """Setup RAG system with real dataset"""
+        if not LANGCHAIN_AVAILABLE:
+            logger.warning("LangChain not available. RAG functionality disabled.")
+            return
+        
+        if not self.rag_retriever.is_available() and self.df is not None:
+            logger.info("Creating RAG vector store from real ARGO data...")
+            
+            documents = []
+            metadata = []
+            
+            for _, row in self.df.iterrows():
+                # Enhanced document content for better RAG
+                content = f"""
+ARGO Float Scientific Measurement Record
+Platform Number: {row.get('platform_number', 'Unknown')}
+Measurement Cycle: {row.get('cycle_number', 'N/A')}
+Date: {row.get('date', 'N/A')}
+Ocean Region: {row.get('region', 'Unknown')}
+Geographic Coordinates: Latitude {row.get('latitude', 'N/A')}° N/S, Longitude {row.get('longitude', 'N/A')}° E/W
+Hydrographic Profile Data:
+- Water Pressure: {row.get('pressure', 'N/A')} decibars (measurement depth indicator)
+- Sea Water Temperature: {row.get('temperature', 'N/A')} degrees Celsius
+- Practical Salinity: {row.get('salinity', 'N/A')} PSU (Practical Salinity Units)
+Data Quality Indicators: Position QC: {row.get('position_qc', 'N/A')}, Temperature QC: {row.get('temp_qc', 'N/A')}, Salinity QC: {row.get('psal_qc', 'N/A')}
+Measurement Errors: Temperature error ±{row.get('temp_error', 'N/A')}°C, Salinity error ±{row.get('psal_error', 'N/A')} PSU, Pressure error ±{row.get('pres_error', 'N/A')} dbar
+Scientific Applications: Ocean circulation studies, climate monitoring, thermohaline circulation analysis, marine ecosystem research
+Data Mode: {row.get('data_mode', 'N/A')} (Real-time or Delayed-mode quality controlled data)
+Research Keywords: ARGO autonomous float, oceanography, hydrographic survey, CTD profile, ocean temperature, ocean salinity, sea water density, ocean pressure, marine science, climate research
+                """.strip()
+                
+                documents.append(content)
+                metadata.append({
+                    'platform_number': row.get('platform_number', 'Unknown'),
+                    'cycle_number': row.get('cycle_number'),
+                    'date': row.get('date'),
+                    'region': row.get('region', 'Unknown'),
+                    'latitude': row.get('latitude'),
+                    'longitude': row.get('longitude'),
+                    'pressure': row.get('pressure'),
+                    'temperature': row.get('temperature'),
+                    'salinity': row.get('salinity'),
+                    'data_mode': row.get('data_mode'),
+                    'doc_type': 'argo_real_measurement'
+                })
+            
+            success = self.rag_retriever.create_vector_store(documents, metadata)
+            if success:
+                logger.info("RAG vector store created successfully from real dataset")
+            else:
+                logger.warning("Failed to create RAG vector store")
+    
+    def detect_plot_request(self, question: str) -> Optional[str]:
+        """Detect if user is requesting a plot"""
+        question_lower = question.lower()
+        
+        plot_keywords = {
+            'temp.*depth|depth.*temp|temperature.*depth|depth.*temperature': 'temp_depth',
+            'sal.*temp|temp.*sal|salinity.*temperature|temperature.*salinity': 'sal_temp',
+            'sal.*depth|depth.*sal|salinity.*depth|depth.*salinity': 'sal_depth'
+        }
+        
+        for pattern, plot_type in plot_keywords.items():
+            if re.search(pattern, question_lower) and any(word in question_lower for word in ['plot', 'graph', 'chart', 'visualize', 'show']):
+                return plot_type
+        
+        return None
+    
+    def generate_plot(self, plot_type: str, filters: Dict = None) -> str:
+        """Generate requested plot"""
+        try:
+            # Apply filters if provided
+            data = self.df.copy()
+            if filters:
+                for key, value in filters.items():
+                    if key in data.columns:
+                        data = data[data[key] == value]
+            
+            if plot_type == 'temp_depth':
+                return self.plotter.create_temp_vs_depth_plot(data)
+            elif plot_type == 'sal_temp':
+                return self.plotter.create_salinity_vs_temp_plot(data)
+            elif plot_type == 'sal_depth':
+                return self.plotter.create_salinity_vs_depth_plot(data)
+            else:
+                return "Unknown plot type requested."
+                
+        except Exception as e:
+            logger.error(f"Error generating plot: {e}")
+            return f"Error generating plot: {e}"
+    
     def analyze_ocean_patterns(self, query_type: str) -> Dict[str, Any]:
-        """Analyze patterns in oceanographic data"""
+        """Analyze patterns in real oceanographic data"""
         try:
             analysis = {}
             
             if query_type == "salinity_temperature":
                 # Analyze salinity-temperature relationship
-                correlation = self.df[['temperature', 'salinity']].corr().iloc[0, 1]
-                temp_stats = self.df['temperature'].describe()
-                sal_stats = self.df['salinity'].describe()
-                
-                analysis = {
-                    'correlation': correlation,
-                    'temperature_stats': temp_stats.to_dict(),
-                    'salinity_stats': sal_stats.to_dict(),
-                    'type': 'salinity_temperature'
-                }
+                valid_data = self.df[(self.df['temperature'].notna()) & (self.df['salinity'].notna())]
+                if len(valid_data) > 0:
+                    correlation = valid_data[['temperature', 'salinity']].corr().iloc[0, 1]
+                    temp_stats = valid_data['temperature'].describe()
+                    sal_stats = valid_data['salinity'].describe()
+                    
+                    analysis = {
+                        'correlation': correlation,
+                        'temperature_stats': temp_stats.to_dict(),
+                        'salinity_stats': sal_stats.to_dict(),
+                        'data_points': len(valid_data),
+                        'type': 'salinity_temperature'
+                    }
+                else:
+                    analysis = {'error': 'No valid temperature/salinity data', 'type': query_type}
             
             elif query_type == "ocean_warming":
                 # Analyze temperature trends over time
-                self.df['date_dt'] = pd.to_datetime(self.df['date'])
-                yearly_temps = self.df.groupby(self.df['date_dt'].dt.year)['temperature'].mean()
-                
-                if len(yearly_temps) > 1:
-                    temp_trend = np.polyfit(yearly_temps.index, yearly_temps.values, 1)[0]
+                valid_data = self.df[(self.df['temperature'].notna()) & (self.df['date'].notna())]
+                if len(valid_data) > 0:
+                    valid_data['date_dt'] = pd.to_datetime(valid_data['date'])
+                    yearly_temps = valid_data.groupby(valid_data['date_dt'].dt.year)['temperature'].mean()
+                    
+                    if len(yearly_temps) > 1:
+                        temp_trend = np.polyfit(yearly_temps.index, yearly_temps.values, 1)[0]
+                    else:
+                        temp_trend = 0
+                    
+                    analysis = {
+                        'yearly_temperatures': yearly_temps.to_dict(),
+                        'warming_trend': temp_trend,
+                        'avg_temperature': valid_data['temperature'].mean(),
+                        'data_points': len(valid_data),
+                        'type': 'ocean_warming'
+                    }
                 else:
-                    temp_trend = 0
-                
-                analysis = {
-                    'yearly_temperatures': yearly_temps.to_dict(),
-                    'warming_trend': temp_trend,
-                    'avg_temperature': self.df['temperature'].mean(),
-                    'type': 'ocean_warming'
-                }
+                    analysis = {'error': 'No valid temperature/date data', 'type': query_type}
             
             elif query_type == "cyclone_prediction":
                 # Analyze conditions relevant to cyclone formation
-                surface_data = self.df[self.df['depth'] <= 50]  # Surface layer
-                warm_water = surface_data[surface_data['temperature'] >= 26.5]  # Cyclone threshold
-                
-                analysis = {
-                    'warm_water_percentage': len(warm_water) / len(surface_data) * 100,
-                    'avg_surface_temp': surface_data['temperature'].mean(),
-                    'high_temp_locations': warm_water[['latitude', 'longitude', 'temperature']].to_dict('records')[:10],
-                    'type': 'cyclone_prediction'
-                }
+                surface_data = self.df[(self.df['pressure'] <= 50) & (self.df['temperature'].notna())]
+                if len(surface_data) > 0:
+                    warm_water = surface_data[surface_data['temperature'] >= 26.5]
+                    
+                    analysis = {
+                        'warm_water_percentage': len(warm_water) / len(surface_data) * 100,
+                        'avg_surface_temp': surface_data['temperature'].mean(),
+                        'surface_data_points': len(surface_data),
+                        'warm_water_points': len(warm_water),
+                        'type': 'cyclone_prediction'
+                    }
+                else:
+                    analysis = {'error': 'No valid surface temperature data', 'type': query_type}
             
             return analysis
             
@@ -603,29 +790,32 @@ Marine data temperature salinity depth pressure ocean conditions float measureme
         if rag_results:
             context_parts.append("RAG Retrieved Context:")
             for i, (doc_content, doc_metadata) in enumerate(rag_results[:2]):
-                # Extract key information from RAG results
-                if 'float_id' in doc_metadata:
-                    context_parts.append(f"RAG Document {i+1}: {doc_content[:300]}...")
+                if 'platform_number' in doc_metadata:
+                    context_parts.append(f"RAG Document {i+1}: Platform {doc_metadata['platform_number']} - {doc_content[:300]}...")
         
         if context_data:
             context_parts.append("ARGO Data Context:")
             for i, data in enumerate(context_data[:3]):
-                context_parts.append(f"Record {i+1}: Float {data['float_id']} on {data['date']} - "
-                                   f"Temp: {data['temperature']}°C, Salinity: {data['salinity']} PSU, "
-                                   f"Depth: {data['depth']}m, Location: {data['latitude']}, {data['longitude']}")
+                platform = data.get('platform_number', 'Unknown')
+                temp = data.get('temperature', 'N/A')
+                sal = data.get('salinity', 'N/A')
+                pressure = data.get('pressure', 'N/A')
+                context_parts.append(f"Record {i+1}: Platform {platform} - Temp: {temp}°C, Salinity: {sal} PSU, Pressure: {pressure} dbar")
         
         if analysis_data and 'error' not in analysis_data:
             context_parts.append("\nData Analysis:")
             if analysis_data['type'] == 'salinity_temperature':
                 context_parts.append(f"Temperature-Salinity correlation: {analysis_data['correlation']:.3f}")
+                context_parts.append(f"Data points: {analysis_data['data_points']}")
                 context_parts.append(f"Average temperature: {analysis_data['temperature_stats']['mean']:.2f}°C")
                 context_parts.append(f"Average salinity: {analysis_data['salinity_stats']['mean']:.2f} PSU")
             elif analysis_data['type'] == 'ocean_warming':
                 context_parts.append(f"Ocean warming trend: {analysis_data['warming_trend']:.4f}°C per year")
                 context_parts.append(f"Average temperature: {analysis_data['avg_temperature']:.2f}°C")
+                context_parts.append(f"Data points: {analysis_data['data_points']}")
             elif analysis_data['type'] == 'cyclone_prediction':
                 context_parts.append(f"Warm water (>26.5°C) percentage: {analysis_data['warm_water_percentage']:.1f}%")
-                context_parts.append(f"Average surface temperature: {analysis_data['avg_surface_temp']:.2f}°C")
+                context_parts.append(f"Surface data points: {analysis_data['surface_data_points']}")
         
         if web_results:
             context_parts.append("\nWeb Search Results:")
@@ -635,8 +825,8 @@ Marine data temperature salinity depth pressure ocean conditions float measureme
         context = "\n".join(context_parts)
         
         # Create comprehensive prompt with RAG enhancement
-        prompt = f"""You are an expert oceanographer and marine scientist analyzing ARGO float data with enhanced context retrieval. 
-Provide a comprehensive, scientific answer to the following question using the provided context.
+        prompt = f"""You are an expert oceanographer analyzing real ARGO float data with enhanced retrieval capabilities. 
+Provide a comprehensive, scientific answer using the provided context.
 
 Question: {question}
 
@@ -645,11 +835,11 @@ Available Context (including RAG-retrieved information):
 
 Please provide a detailed, scientific explanation that:
 1. Directly answers the question
-2. Uses specific data from the ARGO dataset when available
-3. Incorporates relevant information from RAG-retrieved documents
-4. Explains the oceanographic concepts involved
+2. Uses specific data from the real ARGO dataset
+3. Incorporates RAG-retrieved information when available
+4. Explains oceanographic concepts
 5. Discusses scientific implications
-6. Is accessible but scientifically accurate
+6. Maintains scientific accuracy
 
 Response:"""
         
@@ -670,81 +860,80 @@ Response:"""
         question_lower = question.lower()
         
         # Include RAG information in fallback
+        rag_info = ""
         if rag_results:
-            rag_info = f"\nRAG-Retrieved Information: Based on similar ARGO data records, "
             for doc_content, doc_metadata in rag_results[:1]:
-                if 'float_id' in doc_metadata:
-                    rag_info += f"float {doc_metadata['float_id']} shows temperature {doc_metadata.get('temperature', 'N/A')}°C and salinity {doc_metadata.get('salinity', 'N/A')} PSU. "
-        else:
-            rag_info = ""
+                if 'platform_number' in doc_metadata:
+                    rag_info += f"\nRAG Context: Platform {doc_metadata['platform_number']} shows temperature {doc_metadata.get('temperature', 'N/A')}°C and salinity {doc_metadata.get('salinity', 'N/A')} PSU."
         
         if "salinity" in question_lower and "temperature" in question_lower:
-            if analysis_data and analysis_data['type'] == 'salinity_temperature':
+            if analysis_data and analysis_data['type'] == 'salinity_temperature' and 'error' not in analysis_data:
                 corr = analysis_data['correlation']
-                return f"""Based on the ARGO dataset analysis:
+                return f"""Based on real ARGO dataset analysis:
 
 **Salinity-Temperature Relationship:**
 - Correlation coefficient: {corr:.3f}
+- Data points analyzed: {analysis_data['data_points']}
 - Average temperature: {analysis_data['temperature_stats']['mean']:.2f}°C
 - Average salinity: {analysis_data['salinity_stats']['mean']:.2f} PSU
 
-The correlation of {corr:.3f} indicates a {'strong positive' if corr > 0.7 else 'moderate positive' if corr > 0.3 else 'weak'} relationship between salinity and temperature in this dataset. In general oceanography, this relationship is influenced by evaporation (increases both), precipitation (decreases salinity), and mixing processes.{rag_info}"""
+The correlation indicates a {'strong positive' if corr > 0.7 else 'moderate positive' if corr > 0.3 else 'weak'} relationship between salinity and temperature in this real dataset.{rag_info}"""
         
         elif "warming" in question_lower or "trend" in question_lower:
-            if analysis_data and analysis_data['type'] == 'ocean_warming':
+            if analysis_data and analysis_data['type'] == 'ocean_warming' and 'error' not in analysis_data:
                 trend = analysis_data['warming_trend']
-                return f"""Based on the temporal analysis of ARGO data:
+                return f"""Based on real ARGO temporal analysis:
 
-**Ocean Warming Trends:**
+**Ocean Temperature Trends:**
 - Temperature trend: {trend:.4f}°C per year
 - Average temperature: {analysis_data['avg_temperature']:.2f}°C
-- Data shows {'warming' if trend > 0 else 'cooling' if trend < 0 else 'stable'} trend
+- Data points: {analysis_data['data_points']}
+- Trend shows {'warming' if trend > 0 else 'cooling' if trend < 0 else 'stable'} pattern
 
-This trend analysis helps understand regional ocean temperature changes, which are crucial for climate monitoring and marine ecosystem health.{rag_info}"""
+This analysis from real ARGO data provides insights into regional temperature changes.{rag_info}"""
         
         elif "cyclone" in question_lower:
-            if analysis_data and analysis_data['type'] == 'cyclone_prediction':
+            if analysis_data and analysis_data['type'] == 'cyclone_prediction' and 'error' not in analysis_data:
                 warm_pct = analysis_data['warm_water_percentage']
-                return f"""Based on ARGO data analysis for cyclone-relevant conditions:
+                return f"""Based on real ARGO data for cyclone analysis:
 
-**Cyclone Formation Indicators:**
+**Cyclone Formation Conditions:**
 - Warm water (>26.5°C) coverage: {warm_pct:.1f}%
-- Average surface temperature: {analysis_data['avg_surface_temp']:.2f}°C
+- Surface data points: {analysis_data['surface_data_points']}
+- Warm water locations: {analysis_data['warm_water_points']}
 
-ARGO floats provide critical data for cyclone prediction by monitoring:
-1. Sea surface temperatures (cyclones need >26.5°C)
-2. Ocean heat content in upper layers
-3. Salinity patterns affecting water density
-4. Temperature profiles indicating mixed layer depth
-
-Higher percentages of warm water indicate more favorable conditions for tropical cyclone development.{rag_info}"""
+Real ARGO data provides critical cyclone prediction capabilities through ocean temperature monitoring.{rag_info}"""
         
         else:
-            # Generic response with available data
-            response_parts = ["Based on the available ARGO float data:\n"]
+            response_parts = ["Based on real ARGO float dataset:\n"]
             
             if rag_results:
                 response_parts.append("RAG-Enhanced Context:")
                 for doc_content, doc_metadata in rag_results[:2]:
-                    if 'float_id' in doc_metadata:
-                        response_parts.append(f"• Similar measurement: Float {doc_metadata['float_id']} - {doc_metadata.get('temperature', 'N/A')}°C, {doc_metadata.get('salinity', 'N/A')} PSU")
+                    if 'platform_number' in doc_metadata:
+                        temp = doc_metadata.get('temperature', 'N/A')
+                        sal = doc_metadata.get('salinity', 'N/A')
+                        response_parts.append(f"• Platform {doc_metadata['platform_number']}: {temp}°C, {sal} PSU")
             
             if context_data:
-                response_parts.append("Recent measurements show:")
+                response_parts.append("Current measurements:")
                 for data in context_data[:3]:
-                    response_parts.append(f"• Float {data['float_id']}: {data['temperature']}°C, {data['salinity']} PSU at {data['depth']}m depth")
+                    platform = data.get('platform_number', 'Unknown')
+                    temp = data.get('temperature', 'N/A')
+                    sal = data.get('salinity', 'N/A')
+                    response_parts.append(f"• Platform {platform}: {temp}°C, {sal} PSU")
             
             if web_results:
                 response_parts.append(f"\nAdditional information: {web_results[0]['snippet'][:200]}...")
             
             return "\n".join(response_parts)
     
-    def query_database(self, float_id: str = None, date: str = None, 
-                      lat_range: Tuple[float, float] = None,
+    def query_database(self, platform_number: str = None, date: str = None, 
+                      region: str = None, lat_range: Tuple[float, float] = None,
                       lon_range: Tuple[float, float] = None,
                       temp_range: Tuple[float, float] = None,
                       limit: int = 100) -> List[ARGORecord]:
-        """Enhanced database query with more parameters"""
+        """Enhanced database query for real dataset"""
         try:
             conn = sqlite3.connect(self.db_path)
             cursor = conn.cursor()
@@ -752,13 +941,17 @@ Higher percentages of warm water indicate more favorable conditions for tropical
             query = "SELECT * FROM argo_data WHERE 1=1"
             params = []
             
-            if float_id:
-                query += " AND float_id = ?"
-                params.append(float_id)
+            if platform_number:
+                query += " AND platform_number = ?"
+                params.append(platform_number)
             
             if date:
                 query += " AND date = ?"
                 params.append(date)
+            
+            if region:
+                query += " AND region = ?"
+                params.append(region)
             
             if lat_range:
                 query += " AND latitude BETWEEN ? AND ?"
@@ -781,8 +974,13 @@ Higher percentages of warm water indicate more favorable conditions for tropical
             records = []
             for row in results:
                 records.append(ARGORecord(
-                    float_id=row[1], date=row[2], latitude=row[3], longitude=row[4],
-                    depth=row[5], temperature=row[6], salinity=row[7], pressure=row[8]
+                    n_points=row[1] or 0, cycle_number=row[2] or 0, data_mode=row[3] or '',
+                    direction=row[4] or '', platform_number=row[5] or '', position_qc=row[6] or '',
+                    pressure=row[7] or 0.0, pres_error=row[8] or 0.0, pres_qc=row[9] or '',
+                    salinity=row[10] or 0.0, psal_error=row[11] or 0.0, psal_qc=row[12] or '',
+                    temperature=row[13] or 0.0, temp_error=row[14] or 0.0, temp_qc=row[15] or '',
+                    time_qc=row[16] or '', latitude=row[17] or 0.0, longitude=row[18] or 0.0,
+                    date=row[19] or '', region=row[20] or ''
                 ))
             
             return records
@@ -792,32 +990,35 @@ Higher percentages of warm water indicate more favorable conditions for tropical
             return []
     
     def analyze_query(self, question: str) -> Dict[str, Any]:
-        """Enhanced query analysis"""
+        """Enhanced query analysis for real dataset"""
         question_lower = question.lower()
         
-        # Extract float ID
-        float_match = re.search(r'float\s+(\w+)', question_lower)
-        float_id = None
-        if float_match:
-            float_num = float_match.group(1)
-            if not float_num.startswith('argo_'):
-                float_id = f"ARGO_{float_num.zfill(4)}"
-            else:
-                float_id = float_num.upper()
+        # Extract platform number
+        platform_match = re.search(r'platform\s+(\w+)', question_lower)
+        platform_number = platform_match.group(1) if platform_match else None
         
         # Extract date
         date_match = re.search(r'(\d{4}-\d{2}-\d{2})', question)
         date = date_match.group(1) if date_match else None
         
+        # Extract region
+        region_match = re.search(r'region\s+(\w+)', question_lower)
+        region = region_match.group(1) if region_match else None
+        
         # Extract coordinates
         coords = self.parse_coordinates(question)
+        
+        # Check for plot requests
+        plot_request = self.detect_plot_request(question)
         
         # Determine query type and analysis needed
         needs_web_search = False
         needs_analysis = None
-        needs_rag = True  # Enable RAG for most queries
+        needs_rag = True
         
-        if ("salinity" in question_lower and "temperature" in question_lower and 
+        if plot_request:
+            query_type = f"plot_{plot_request}"
+        elif ("salinity" in question_lower and "temperature" in question_lower and 
             "relationship" in question_lower):
             query_type = "salinity_temperature_analysis"
             needs_analysis = "salinity_temperature"
@@ -836,13 +1037,11 @@ Higher percentages of warm water indicate more favorable conditions for tropical
             query_type = "temperature"
         elif "salinity" in question_lower:
             query_type = "salinity"
-        elif "depth" in question_lower:
-            query_type = "depth"
         elif "pressure" in question_lower:
             query_type = "pressure"
         elif "satellite" in question_lower or "image" in question_lower:
             query_type = "satellite"
-            needs_rag = False  # RAG not needed for satellite queries
+            needs_rag = False
         else:
             query_type = "general"
             if any(term in question_lower for term in ["explain", "what", "how", "why"]):
@@ -850,9 +1049,11 @@ Higher percentages of warm water indicate more favorable conditions for tropical
         
         return {
             'type': query_type,
-            'float_id': float_id,
+            'platform_number': platform_number,
             'date': date,
+            'region': region,
             'coordinates': coords,
+            'plot_request': plot_request,
             'needs_web_search': needs_web_search,
             'needs_analysis': needs_analysis,
             'needs_rag': needs_rag
@@ -897,12 +1098,16 @@ Higher percentages of warm water indicate more favorable conditions for tropical
             return f"Error generating satellite image: {e}"
     
     def chat(self, question: str) -> str:
-        """Enhanced main chat interface with AI, web search, and RAG"""
+        """Enhanced chat interface with plotting, real dataset, and GPU-accelerated RAG"""
         try:
             logger.info(f"Processing: {question[:50]}...")
             
             # Analyze the query
             query_info = self.analyze_query(question)
+            
+            # Handle plot requests
+            if query_info['plot_request']:
+                return self.generate_plot(query_info['plot_request'])
             
             # Handle satellite imagery
             if query_info['type'] == 'satellite':
@@ -926,22 +1131,25 @@ Higher percentages of warm water indicate more favorable conditions for tropical
             
             # Get relevant ARGO data
             records = self.query_database(
-                float_id=query_info['float_id'],
+                platform_number=query_info['platform_number'],
                 date=query_info['date'],
+                region=query_info['region'],
                 limit=50
             )
             
             if records:
                 context_data = [
                     {
-                        'float_id': r.float_id,
+                        'platform_number': r.platform_number,
+                        'cycle_number': r.cycle_number,
                         'date': r.date,
+                        'region': r.region,
                         'latitude': r.latitude,
                         'longitude': r.longitude,
-                        'depth': r.depth,
+                        'pressure': r.pressure,
                         'temperature': r.temperature,
                         'salinity': r.salinity,
-                        'pressure': r.pressure
+                        'data_mode': r.data_mode
                     } for r in records[:10]
                 ]
             
@@ -961,7 +1169,7 @@ Higher percentages of warm water indicate more favorable conditions for tropical
                 
                 web_results = self.web_search.search(search_query, max_results=3)
             
-            # Generate intelligent response with RAG enhancement
+            # Generate intelligent response with all enhancements
             if (context_data or analysis_data or web_results or rag_results or 
                 query_info['type'] in ['salinity_temperature_analysis', 'ocean_warming_analysis', 'cyclone_analysis']):
                 
@@ -969,11 +1177,11 @@ Higher percentages of warm water indicate more favorable conditions for tropical
                     question, context_data, web_results, analysis_data, rag_results
                 )
             
-            # Fallback to simple data search if no specific data found
+            # Fallback to search
             if self.search_engine:
                 search_results = self.search_engine.search(question, k=5)
                 if search_results:
-                    best_match = search_results[0][1]  # metadata from best match
+                    best_match = search_results[0][1]
                     context_data = [best_match]
                     
                     return self.generate_intelligent_response(
@@ -981,137 +1189,144 @@ Higher percentages of warm water indicate more favorable conditions for tropical
                     )
             
             # Final fallback
-            return ("I couldn't find specific ARGO data for your query. Try asking about:\n"
+            return ("I couldn't find specific data for your query. Try asking about:\n"
                    "• Temperature-salinity relationships\n"
                    "• Ocean warming trends\n"
                    "• Cyclone prediction using ocean data\n"
-                   "• Specific float measurements (e.g., 'float 1023 data')")
+                   "• Plotting: 'plot temperature vs depth' or similar\n"
+                   "• Specific platform data (e.g., 'platform 6902746 data')")
             
         except Exception as e:
             logger.error(f"Chat error: {e}")
             return f"Error processing question: {e}"
     
     def get_data_summary(self) -> str:
-        """Get enhanced dataset summary with analysis and RAG status"""
+        """Get enhanced dataset summary with real data statistics"""
         if self.df is None:
             return "No data loaded"
         
-        # Calculate additional statistics
-        temp_by_depth = self.df.groupby(pd.cut(self.df['depth'], bins=5))['temperature'].mean()
-        seasonal_temps = self.df.groupby(pd.to_datetime(self.df['date']).dt.month)['temperature'].mean()
+        # Calculate statistics for real dataset
+        total_platforms = self.df['platform_number'].nunique() if 'platform_number' in self.df.columns else 0
+        date_range = f"{self.df['date'].min()} to {self.df['date'].max()}" if 'date' in self.df.columns else "Unknown"
+        regions = self.df['region'].nunique() if 'region' in self.df.columns else 0
         
-        rag_status = "✅ Active" if self.rag_retriever.is_available() else "❌ Not available"
-        langchain_status = "✅ Available" if LANGCHAIN_AVAILABLE else "❌ Not installed"
+        # Temperature statistics
+        temp_stats = self.df['temperature'].describe() if 'temperature' in self.df.columns else None
+        sal_stats = self.df['salinity'].describe() if 'salinity' in self.df.columns else None
+        pressure_stats = self.df['pressure'].describe() if 'pressure' in self.df.columns else None
         
-        return f"""🌊 Enhanced ARGO Dataset Summary with RAG:
-📊 Dataset Overview:
+        rag_status = "Active" if self.rag_retriever.is_available() else "Not available"
+        langchain_status = "Available" if LANGCHAIN_AVAILABLE else "Not installed"
+        
+        return f"""Real ARGO Dataset Summary with GPU-Accelerated RAG:
+Dataset Overview:
 • Total records: {len(self.df):,}
-• Unique floats: {self.df['float_id'].nunique()}
-• Date range: {self.df['date'].min()} to {self.df['date'].max()}
-• Geographic coverage: {self.df['latitude'].min():.1f}° to {self.df['latitude'].max():.1f}° lat, {self.df['longitude'].min():.1f}° to {self.df['longitude'].max():.1f}° lon
+• Unique platforms: {total_platforms}
+• Regions covered: {regions}
+• Date range: {date_range}
+• Device: {DEVICE}
 
-🌡️ Temperature Analysis:
-• Range: {self.df['temperature'].min():.1f}°C to {self.df['temperature'].max():.1f}°C
-• Average: {self.df['temperature'].mean():.1f}°C
-• Standard deviation: {self.df['temperature'].std():.2f}°C
+Temperature Analysis:
+• Range: {temp_stats['min']:.1f}°C to {temp_stats['max']:.1f}°C
+• Average: {temp_stats['mean']:.1f}°C
+• Valid measurements: {temp_stats['count']:,.0f}
 
-🧂 Salinity Analysis:
-• Range: {self.df['salinity'].min():.1f} to {self.df['salinity'].max():.1f} PSU
-• Average: {self.df['salinity'].mean():.1f} PSU
+Salinity Analysis:
+• Range: {sal_stats['min']:.1f} to {sal_stats['max']:.1f} PSU
+• Average: {sal_stats['mean']:.1f} PSU
+• Valid measurements: {sal_stats['count']:,.0f}
 
-🏊 Depth Coverage:
-• Range: {self.df['depth'].min():.1f}m to {self.df['depth'].max():.1f}m
-• Average measurement depth: {self.df['depth'].mean():.1f}m
+Pressure Coverage:
+• Range: {pressure_stats['min']:.1f} to {pressure_stats['max']:.1f} dbar
+• Average: {pressure_stats['mean']:.1f} dbar
 
-🤖 AI Capabilities:
-• Phi-3.5 model: {'✅ Loaded' if self.ai_model.model else '❌ Not available'}
-• Web search: ✅ Enabled
-• Pattern analysis: ✅ Enabled
+AI Capabilities:
+• Phi-3.5 model: {'Loaded' if self.ai_model.model else 'Not available'} ({DEVICE})
+• Web search: Enabled
+• Pattern analysis: Enabled
+• Plotting service: Available
 
-🔍 RAG System Status:
+RAG System Status:
 • LangChain: {langchain_status}
 • FAISS Vector Store: {rag_status}
-• RAG Retrieval: {'✅ Enhanced context retrieval available' if self.rag_retriever.is_available() else '❌ Basic search only'}"""
+• GPU Acceleration: {'Yes' if DEVICE in ['cuda', 'mps'] else 'No'} ({DEVICE})
+• Enhanced context retrieval: {'Available' if self.rag_retriever.is_available() else 'Basic search only'}"""
 
 def main():
-    """Enhanced main function with AI and RAG capabilities"""
-    print("🌊 Enhanced ARGO AI Chatbot with Phi-3.5, Web Search & RAG")
-    print("=" * 70)
+    """Main function with real dataset and GPU support"""
+    print(f"Enhanced ARGO AI Chatbot with Real Dataset & GPU Support ({DEVICE})")
+    print("=" * 80)
     
     try:
         bot = EnhancedARGOChatbot()
         
-        print("✅ Enhanced ARGO AI Chatbot with RAG is ready!")
+        print("Enhanced ARGO AI Chatbot with real dataset is ready!")
         print(bot.get_data_summary())
-        print(f"\n🔍 Example intelligent queries with RAG enhancement:")
-        print("• 'Explain the relationship between salinity and temperature in ARGO float data'")
-        print("• 'What trends in ocean warming can be observed from this dataset?'")
-        print("• 'How can ARGO float data be useful for predicting cyclones?'")
-        print("• 'What is the impact of climate change on ocean salinity patterns?'")
-        print("• 'Show me temperature data for float 1023'")
-        print("• 'What are the latest developments in ARGO float technology?'")
-        print("• 'Compare temperature profiles between different ocean regions'")
+        print(f"\nExample queries with real dataset:")
+        print("• 'Explain the relationship between salinity and temperature'")
+        print("• 'Plot temperature vs depth for Indian Ocean data'")
+        print("• 'Show salinity vs temperature graph'")
+        print("• 'What are ocean warming trends in this dataset?'")
+        print("• 'Platform 6902746 temperature data'")
+        print("• 'How does cyclone prediction use ARGO data?'")
         print("\nCommands: 'help', 'summary', 'quit'\n")
         
         while True:
             try:
-                user_input = input("🤖 You: ").strip()
+                user_input = input("You: ").strip()
                 
                 if not user_input:
                     continue
                     
                 if user_input.lower() in ["quit", "exit", "q"]:
-                    print("👋 Goodbye!")
+                    print("Goodbye!")
                     break
                     
                 if user_input.lower() in ["help", "h"]:
                     print(f"""
-🔍 Available query types (with RAG enhancement):
-• 🧠 Analytical questions: "Explain the relationship between salinity and temperature"
-• 📈 Trend analysis: "What ocean warming trends do you see?"
-• 🌀 Climate predictions: "How does ARGO data help predict cyclones?"
-• 📊 Specific data: "Temperature of float 1023 on 2022-05-12"
-• 🛰️ Satellite imagery: "Satellite image at 25.5, -80.2"
-• 🌍 General knowledge: "What are ARGO floats used for?"
-• 📋 Dataset info: "summary" or "stats"
+Available features with real dataset:
+• Analytical questions: "Relationship between salinity and temperature"
+• Plotting: "plot temperature vs depth", "graph salinity vs temperature"
+• Trend analysis: "Ocean warming trends"
+• Platform-specific: "Platform 6902746 data"
+• Regional analysis: "Indian Ocean temperature patterns"
+• Climate predictions: "Cyclone prediction using ARGO data"
+• General knowledge: "What are ARGO floats?"
 
-🚀 RAG Enhancement:
-The chatbot now uses Retrieval Augmented Generation (RAG) to provide more
-accurate and contextual responses by retrieving relevant information from
-the ARGO dataset using semantic similarity search.
-
-RAG Status: {'✅ Active' if bot.rag_retriever.is_available() else '❌ Not available'}
+GPU Status: {DEVICE}
+RAG Enhancement: {'Active' if bot.rag_retriever.is_available() else 'Not available'}
+Plotting: Available (matplotlib + seaborn)
                     """)
                     continue
                 
                 if user_input.lower() in ["summary", "stats", "info"]:
-                    print(f"📊 {bot.get_data_summary()}\n")
+                    print(f"{bot.get_data_summary()}\n")
                     continue
                 
-                print("🤔 Thinking... (with RAG enhancement)")
+                print("Processing... (with GPU-accelerated RAG)")
                 start_time = time.time()
                 answer = bot.chat(user_input)
                 response_time = time.time() - start_time
                 
-                print(f"🌊 {answer}")
-                print(f"⏱️ Response time: {response_time:.2f} seconds\n")
+                print(f"{answer}")
+                print(f"Response time: {response_time:.2f} seconds\n")
                 
             except KeyboardInterrupt:
-                print("\n👋 Goodbye!")
+                print("\nGoodbye!")
                 break
             except Exception as e:
                 logger.error(f"Error in main loop: {e}")
-                print(f"❌ Error: {e}")
+                print(f"Error: {e}")
                 
     except Exception as e:
         logger.error(f"Fatal error: {e}")
-        print(f"❌ Fatal error: {e}")
-        print("\n🔧 Setup Requirements:")
-        print("1. Install dependencies: pip install llama-cpp-python pandas numpy requests")
-        print("2. Install RAG dependencies: pip install langchain langchain-community faiss-cpu sentence-transformers")
-        print("3. Download Phi-3.5-mini-instruct-Q4_K_M.gguf to ./models/ directory")
-        print("4. Ensure FAISS index files (argo_index.faiss, argo_metadata.pkl) are present")
-        print("5. Ensure internet connection for web search functionality")
+        print(f"Fatal error: {e}")
+        print("\nSetup Requirements:")
+        print("1. pip install llama-cpp-python pandas numpy requests matplotlib seaborn")
+        print("2. pip install langchain langchain-community faiss-cpu sentence-transformers torch")
+        print("3. Place argo_data.csv in the current directory")
+        print("4. Download Phi-3.5-mini-instruct-Q4_K_M.gguf to ./models/ directory")
+        print("5. Ensure internet connection for web search")
 
 if __name__ == "__main__":
     main()
