@@ -14,12 +14,16 @@ import warnings
 import requests
 import time
 from urllib.parse import quote
-
+import matplotlib
+matplotlib.use('Agg')  # Use non-GUI backend
 # Plotting imports
 import matplotlib.pyplot as plt
 import seaborn as sns
 from io import BytesIO
 import base64
+import torch 
+import uuid
+
 
 # Suppress warnings
 warnings.filterwarnings("ignore")
@@ -195,15 +199,51 @@ class RAGRetriever:
         return LANGCHAIN_AVAILABLE and self.vector_store is not None
 
 class PlottingService:
-    """Service for generating oceanographic plots"""
+    """Enhanced service for generating oceanographic plots with image saving"""
     
     def __init__(self):
         plt.style.use('seaborn-v0_8' if 'seaborn-v0_8' in plt.style.available else 'default')
-        self.figsize = (10, 8)
+        self.figsize = (12, 8)
         self.dpi = 100
-    
-    def create_temp_vs_depth_plot(self, df: pd.DataFrame, title: str = "Temperature vs Depth") -> str:
-        """Create temperature vs depth plot"""
+        
+        # Create static directory for saving images
+        self.static_dir = Path("static")
+        self.static_dir.mkdir(exist_ok=True)
+        
+    def _save_and_encode_plot(self, fig, plot_type: str) -> dict:
+        """Save plot as PNG and return both file path and base64 encoded data"""
+        try:
+            # Generate unique filename
+            filename = f"{plot_type}_{uuid.uuid4().hex[:8]}.png"
+            filepath = self.static_dir / filename
+            
+            # Save as PNG file
+            fig.savefig(filepath, format='png', bbox_inches='tight', dpi=self.dpi, 
+                       facecolor='white', edgecolor='none')
+            
+            # Also create base64 encoded version for immediate display
+            buffer = BytesIO()
+            fig.savefig(buffer, format='png', bbox_inches='tight', dpi=self.dpi,
+                       facecolor='white', edgecolor='none')
+            buffer.seek(0)
+            img_base64 = base64.b64encode(buffer.getvalue()).decode()
+            
+            plt.close(fig)
+            
+            return {
+                'type': 'image',
+                'filename': filename,
+                'filepath': str(filepath),
+                'base64': img_base64,
+                'url': f"/static/{filename}"
+            }
+            
+        except Exception as e:
+            plt.close(fig)
+            raise e
+            
+    def create_temp_vs_depth_plot(self, df: pd.DataFrame, title: str = "Temperature vs Depth") -> dict:
+        """Create temperature vs depth plot and return image data"""
         try:
             fig, ax = plt.subplots(figsize=self.figsize, dpi=self.dpi)
             
@@ -211,39 +251,55 @@ class PlottingService:
             valid_data = df[(df['temperature'].notna()) & (df['pressure'].notna())]
             
             if len(valid_data) == 0:
-                return "No valid temperature/depth data available for plotting."
+                plt.close(fig)
+                return {
+                    'type': 'error',
+                    'message': 'No valid temperature/depth data available for plotting.'
+                }
+            
+            # Limit data points to 200 to reduce clutter
+            if len(valid_data) > 200:
+                valid_data = valid_data.sample(n=200, random_state=42)
             
             # Create scatter plot with color based on temperature
             scatter = ax.scatter(valid_data['temperature'], valid_data['pressure'], 
-                               c=valid_data['temperature'], cmap='coolwarm', alpha=0.6, s=20)
+                               c=valid_data['temperature'], cmap='coolwarm', alpha=0.7, s=30)
             
-            ax.set_xlabel('Temperature (°C)', fontsize=12)
-            ax.set_ylabel('Pressure (dbar)', fontsize=12)
-            ax.set_title(title, fontsize=14, fontweight='bold')
+            ax.set_xlabel('Temperature (°C)', fontsize=14, fontweight='bold')
+            ax.set_ylabel('Pressure/Depth (dbar)', fontsize=14, fontweight='bold')
+            ax.set_title(title, fontsize=16, fontweight='bold', pad=20)
             ax.invert_yaxis()  # Depth increases downward
             
             # Add colorbar
             cbar = plt.colorbar(scatter, ax=ax)
-            cbar.set_label('Temperature (°C)', fontsize=10)
+            cbar.set_label('Temperature (°C)', fontsize=12, fontweight='bold')
             
-            # Add grid
-            ax.grid(True, alpha=0.3)
+            # Add grid and styling
+            ax.grid(True, alpha=0.3, linestyle='--')
+            ax.set_facecolor('#f8f9fa')
             
-            # Save plot to base64 string
-            buffer = BytesIO()
-            plt.savefig(buffer, format='png', bbox_inches='tight', dpi=self.dpi)
-            buffer.seek(0)
-            plot_data = base64.b64encode(buffer.getvalue()).decode()
-            plt.close(fig)
+            # Add data point count annotation
+            ax.text(0.02, 0.98, f'Data points: {len(valid_data)}', 
+                   transform=ax.transAxes, fontsize=10, 
+                   bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8),
+                   verticalalignment='top')
             
-            return f"Temperature vs Depth plot created successfully. Data points: {len(valid_data)}"
+            plt.tight_layout()
+            
+            result = self._save_and_encode_plot(fig, 'temp_vs_depth')
+            result['data_points'] = len(valid_data)
+            result['description'] = f"Temperature vs Depth plot with {len(valid_data)} data points"
+            
+            return result
             
         except Exception as e:
-            logger.error(f"Error creating temperature vs depth plot: {e}")
-            return f"Error creating plot: {e}"
-    
-    def create_salinity_vs_temp_plot(self, df: pd.DataFrame, title: str = "Salinity vs Temperature") -> str:
-        """Create salinity vs temperature plot"""
+            return {
+                'type': 'error',
+                'message': f"Error creating temperature vs depth plot: {str(e)}"
+            }
+            
+    def create_salinity_vs_temp_plot(self, df: pd.DataFrame, title: str = "Salinity vs Temperature") -> dict:
+        """Create salinity vs temperature plot and return image data"""
         try:
             fig, ax = plt.subplots(figsize=self.figsize, dpi=self.dpi)
             
@@ -251,38 +307,56 @@ class PlottingService:
             valid_data = df[(df['temperature'].notna()) & (df['salinity'].notna())]
             
             if len(valid_data) == 0:
-                return "No valid salinity/temperature data available for plotting."
+                plt.close(fig)
+                return {
+                    'type': 'error',
+                    'message': 'No valid salinity/temperature data available for plotting.'
+                }
+            
+            # Limit data points to 200 to reduce clutter
+            if len(valid_data) > 200:
+                valid_data = valid_data.sample(n=200, random_state=42)
             
             # Create scatter plot with color based on depth (pressure)
             scatter = ax.scatter(valid_data['temperature'], valid_data['salinity'], 
-                               c=valid_data['pressure'], cmap='viridis', alpha=0.6, s=20)
+                               c=valid_data['pressure'] if 'pressure' in valid_data.columns else 'blue', 
+                               cmap='viridis', alpha=0.7, s=30)
             
-            ax.set_xlabel('Temperature (°C)', fontsize=12)
-            ax.set_ylabel('Salinity (PSU)', fontsize=12)
-            ax.set_title(title, fontsize=14, fontweight='bold')
+            ax.set_xlabel('Temperature (°C)', fontsize=14, fontweight='bold')
+            ax.set_ylabel('Salinity (PSU)', fontsize=14, fontweight='bold')
+            ax.set_title(title, fontsize=16, fontweight='bold', pad=20)
             
-            # Add colorbar
-            cbar = plt.colorbar(scatter, ax=ax)
-            cbar.set_label('Pressure (dbar)', fontsize=10)
+            # Add colorbar if pressure data available
+            if 'pressure' in valid_data.columns and valid_data['pressure'].notna().any():
+                cbar = plt.colorbar(scatter, ax=ax)
+                cbar.set_label('Pressure/Depth (dbar)', fontsize=12, fontweight='bold')
             
-            # Add grid
-            ax.grid(True, alpha=0.3)
+            # Add grid and styling
+            ax.grid(True, alpha=0.3, linestyle='--')
+            ax.set_facecolor('#f8f9fa')
             
-            # Save plot
-            buffer = BytesIO()
-            plt.savefig(buffer, format='png', bbox_inches='tight', dpi=self.dpi)
-            buffer.seek(0)
-            plot_data = base64.b64encode(buffer.getvalue()).decode()
-            plt.close(fig)
+            # Add data point count annotation
+            ax.text(0.02, 0.98, f'Data points: {len(valid_data)}', 
+                   transform=ax.transAxes, fontsize=10, 
+                   bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8),
+                   verticalalignment='top')
             
-            return f"Salinity vs Temperature plot created successfully. Data points: {len(valid_data)}"
+            plt.tight_layout()
+            
+            result = self._save_and_encode_plot(fig, 'salinity_vs_temp')
+            result['data_points'] = len(valid_data)
+            result['description'] = f"Salinity vs Temperature plot with {len(valid_data)} data points"
+            
+            return result
             
         except Exception as e:
-            logger.error(f"Error creating salinity vs temperature plot: {e}")
-            return f"Error creating plot: {e}"
-    
-    def create_salinity_vs_depth_plot(self, df: pd.DataFrame, title: str = "Salinity vs Depth") -> str:
-        """Create salinity vs depth plot"""
+            return {
+                'type': 'error',
+                'message': f"Error creating salinity vs temperature plot: {str(e)}"
+            }
+            
+    def create_salinity_vs_depth_plot(self, df: pd.DataFrame, title: str = "Salinity vs Depth") -> dict:
+        """Create salinity vs depth plot and return image data"""
         try:
             fig, ax = plt.subplots(figsize=self.figsize, dpi=self.dpi)
             
@@ -290,37 +364,109 @@ class PlottingService:
             valid_data = df[(df['salinity'].notna()) & (df['pressure'].notna())]
             
             if len(valid_data) == 0:
-                return "No valid salinity/depth data available for plotting."
+                plt.close(fig)
+                return {
+                    'type': 'error',
+                    'message': 'No valid salinity/depth data available for plotting.'
+                }
+            
+            # Limit data points to 200 to reduce clutter
+            if len(valid_data) > 200:
+                valid_data = valid_data.sample(n=200, random_state=42)
             
             # Create scatter plot with color based on salinity
             scatter = ax.scatter(valid_data['salinity'], valid_data['pressure'], 
-                               c=valid_data['salinity'], cmap='plasma', alpha=0.6, s=20)
+                               c=valid_data['salinity'], cmap='plasma', alpha=0.7, s=30)
             
-            ax.set_xlabel('Salinity (PSU)', fontsize=12)
-            ax.set_ylabel('Pressure (dbar)', fontsize=12)
-            ax.set_title(title, fontsize=14, fontweight='bold')
+            ax.set_xlabel('Salinity (PSU)', fontsize=14, fontweight='bold')
+            ax.set_ylabel('Pressure/Depth (dbar)', fontsize=14, fontweight='bold')
+            ax.set_title(title, fontsize=16, fontweight='bold', pad=20)
             ax.invert_yaxis()  # Depth increases downward
             
             # Add colorbar
             cbar = plt.colorbar(scatter, ax=ax)
-            cbar.set_label('Salinity (PSU)', fontsize=10)
+            cbar.set_label('Salinity (PSU)', fontsize=12, fontweight='bold')
             
-            # Add grid
-            ax.grid(True, alpha=0.3)
+            # Add grid and styling
+            ax.grid(True, alpha=0.3, linestyle='--')
+            ax.set_facecolor('#f8f9fa')
             
-            # Save plot
-            buffer = BytesIO()
-            plt.savefig(buffer, format='png', bbox_inches='tight', dpi=self.dpi)
-            buffer.seek(0)
-            plot_data = base64.b64encode(buffer.getvalue()).decode()
-            plt.close(fig)
+            # Add data point count annotation
+            ax.text(0.02, 0.98, f'Data points: {len(valid_data)}', 
+                   transform=ax.transAxes, fontsize=10, 
+                   bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8),
+                   verticalalignment='top')
             
-            return f"Salinity vs Depth plot created successfully. Data points: {len(valid_data)}"
+            plt.tight_layout()
+            
+            result = self._save_and_encode_plot(fig, 'salinity_vs_depth')
+            result['data_points'] = len(valid_data)
+            result['description'] = f"Salinity vs Depth plot with {len(valid_data)} data points"
+            
+            return result
             
         except Exception as e:
-            logger.error(f"Error creating salinity vs depth plot: {e}")
-            return f"Error creating plot: {e}"
-
+            return {
+                'type': 'error',
+                'message': f"Error creating salinity vs depth plot: {str(e)}"
+            }
+            
+    def create_pressure_vs_time_plot(self, df: pd.DataFrame, title: str = "Pressure vs Time") -> dict:
+        """Create pressure vs time plot"""
+        try:
+            fig, ax = plt.subplots(figsize=self.figsize, dpi=self.dpi)
+            
+            # Filter out invalid data
+            valid_data = df[(df['pressure'].notna()) & (df['date'].notna())]
+            
+            if len(valid_data) == 0:
+                plt.close(fig)
+                return {
+                    'type': 'error',
+                    'message': 'No valid pressure/time data available for plotting.'
+                }
+            
+            # Convert date to datetime
+            valid_data['date_dt'] = pd.to_datetime(valid_data['date'])
+            valid_data = valid_data.sort_values('date_dt')
+            
+            # Limit data points to 200 to reduce clutter
+            if len(valid_data) > 200:
+                valid_data = valid_data.sample(n=200, random_state=42).sort_values('date_dt')
+            
+            # Create line plot
+            ax.plot(valid_data['date_dt'], valid_data['pressure'], 'o-', alpha=0.7, markersize=4)
+            
+            ax.set_xlabel('Date', fontsize=14, fontweight='bold')
+            ax.set_ylabel('Pressure (dbar)', fontsize=14, fontweight='bold')
+            ax.set_title(title, fontsize=16, fontweight='bold', pad=20)
+            
+            # Add grid and styling
+            ax.grid(True, alpha=0.3, linestyle='--')
+            ax.set_facecolor('#f8f9fa')
+            
+            # Rotate x-axis labels for better readability
+            plt.xticks(rotation=45)
+            
+            # Add data point count annotation
+            ax.text(0.02, 0.98, f'Data points: {len(valid_data)}', 
+                   transform=ax.transAxes, fontsize=10, 
+                   bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8),
+                   verticalalignment='top')
+            
+            plt.tight_layout()
+            
+            result = self._save_and_encode_plot(fig, 'pressure_vs_time')
+            result['data_points'] = len(valid_data)
+            result['description'] = f"Pressure vs Time plot with {len(valid_data)} data points"
+            
+            return result
+            
+        except Exception as e:
+            return {
+                'type': 'error',
+                'message': f"Error creating pressure vs time plot: {str(e)}"
+            }
 class DuckDuckGoSearch:
     """Simple DuckDuckGo search integration"""
     
@@ -674,44 +820,83 @@ Research Keywords: ARGO autonomous float, oceanography, hydrographic survey, CTD
                 logger.warning("Failed to create RAG vector store")
     
     def detect_plot_request(self, question: str) -> Optional[str]:
-        """Detect if user is requesting a plot"""
+        """Enhanced plot detection with more patterns"""
         question_lower = question.lower()
-        
+    
         plot_keywords = {
-            'temp.*depth|depth.*temp|temperature.*depth|depth.*temperature': 'temp_depth',
-            'sal.*temp|temp.*sal|salinity.*temperature|temperature.*salinity': 'sal_temp',
-            'sal.*depth|depth.*sal|salinity.*depth|depth.*salinity': 'sal_depth'
+            # Temperature vs Depth patterns
+            r'(temp.*depth|depth.*temp|temperature.*depth|depth.*temperature|temp.*vs.*depth|depth.*vs.*temp)': 'temp_depth',
+        
+            # Salinity vs Temperature patterns  
+            r'(sal.*temp|temp.*sal|salinity.*temperature|temperature.*salinity|sal.*vs.*temp|temp.*vs.*sal)': 'sal_temp',
+            
+            # Salinity vs Depth patterns
+            r'(sal.*depth|depth.*sal|salinity.*depth|depth.*salinity|sal.*vs.*depth|depth.*vs.*sal)': 'sal_depth',
+            
+            # Pressure vs Time patterns
+            r'(pressure.*time|time.*pressure|pressure.*vs.*time|time.*vs.*pressure)': 'pressure_time',
+            
+            # General plotting keywords
+            r'(plot|graph|chart|visualize|show.*graph|show.*plot|display.*graph)': 'general_plot'
         }
         
-        for pattern, plot_type in plot_keywords.items():
-            if re.search(pattern, question_lower) and any(word in question_lower for word in ['plot', 'graph', 'chart', 'visualize', 'show']):
-                return plot_type
+        # Check for plot request indicators
+        plot_indicators = ['plot', 'graph', 'chart', 'visualize', 'show', 'display', 'draw']
+        has_plot_indicator = any(indicator in question_lower for indicator in plot_indicators)
+    
+        if has_plot_indicator:
+            for pattern, plot_type in plot_keywords.items():
+                if plot_type != 'general_plot' and re.search(pattern, question_lower):
+                    return plot_type
+            
+            # If general plot request, try to infer from context
+            if 'temperature' in question_lower and 'depth' in question_lower:
+                return 'temp_depth'
+            elif 'salinity' in question_lower and 'temperature' in question_lower:
+                return 'sal_temp'
+            elif 'salinity' in question_lower and 'depth' in question_lower:
+                return 'sal_depth'
+            elif 'pressure' in question_lower and 'time' in question_lower:
+                return 'pressure_time'
         
         return None
     
-    def generate_plot(self, plot_type: str, filters: Dict = None) -> str:
-        """Generate requested plot"""
+    def generate_plot(self, plot_type: str, filters: Dict = None) -> dict:
+        """Generate requested plot and return image data"""
         try:
+            logger.info(f"Generating {plot_type} plot...")
+            
             # Apply filters if provided
             data = self.df.copy()
             if filters:
                 for key, value in filters.items():
-                    if key in data.columns:
-                        data = data[data[key] == value]
-            
+                    if key in data.columns and pd.notna(value):
+                        if isinstance(value, str):
+                            data = data[data[key].str.contains(value, case=False, na=False)]
+                        else:
+                            data = data[data[key] == value]
+        
+            # Generate appropriate plot
             if plot_type == 'temp_depth':
-                return self.plotter.create_temp_vs_depth_plot(data)
+                return self.plotter.create_temp_vs_depth_plot(data, "Temperature vs Depth Profile")
             elif plot_type == 'sal_temp':
-                return self.plotter.create_salinity_vs_temp_plot(data)
+                return self.plotter.create_salinity_vs_temp_plot(data, "Salinity vs Temperature Relationship")
             elif plot_type == 'sal_depth':
-                return self.plotter.create_salinity_vs_depth_plot(data)
+                return self.plotter.create_salinity_vs_depth_plot(data, "Salinity vs Depth Profile")
+            elif plot_type == 'pressure_time':
+                return self.plotter.create_pressure_vs_time_plot(data, "Pressure vs Time Series")
             else:
-                return "Unknown plot type requested."
-                
+                return {
+                    'type': 'error',
+                    'message': f"Unknown plot type: {plot_type}"
+                }
+            
         except Exception as e:
-            logger.error(f"Error generating plot: {e}")
-            return f"Error generating plot: {e}"
-    
+            logger.error(f"Error generating {plot_type} plot: {e}")
+            return {
+                'type': 'error',
+                'message': f"Error generating plot: {str(e)}"
+            }
     def analyze_ocean_patterns(self, query_type: str) -> Dict[str, Any]:
         """Analyze patterns in real oceanographic data"""
         try:
@@ -990,7 +1175,7 @@ Real ARGO data provides critical cyclone prediction capabilities through ocean t
             return []
     
     def analyze_query(self, question: str) -> Dict[str, Any]:
-        """Enhanced query analysis for real dataset"""
+        """Enhanced query analysis with better plot detection"""
         question_lower = question.lower()
         
         # Extract platform number
@@ -1008,7 +1193,7 @@ Real ARGO data provides critical cyclone prediction capabilities through ocean t
         # Extract coordinates
         coords = self.parse_coordinates(question)
         
-        # Check for plot requests
+        # Check for plot requests - this is the key enhancement
         plot_request = self.detect_plot_request(question)
         
         # Determine query type and analysis needed
@@ -1018,8 +1203,10 @@ Real ARGO data provides critical cyclone prediction capabilities through ocean t
         
         if plot_request:
             query_type = f"plot_{plot_request}"
+            # For plot requests, we might not need web search unless it's for context
+            needs_web_search = False
         elif ("salinity" in question_lower and "temperature" in question_lower and 
-            "relationship" in question_lower):
+              "relationship" in question_lower):
             query_type = "salinity_temperature_analysis"
             needs_analysis = "salinity_temperature"
         elif ("warming" in question_lower or "trend" in question_lower):
@@ -1046,18 +1233,18 @@ Real ARGO data provides critical cyclone prediction capabilities through ocean t
             query_type = "general"
             if any(term in question_lower for term in ["explain", "what", "how", "why"]):
                 needs_web_search = True
-        
+    
         return {
-            'type': query_type,
-            'platform_number': platform_number,
-            'date': date,
-            'region': region,
-            'coordinates': coords,
-            'plot_request': plot_request,
-            'needs_web_search': needs_web_search,
-            'needs_analysis': needs_analysis,
-            'needs_rag': needs_rag
-        }
+        'type': query_type,
+        'platform_number': platform_number,
+        'date': date,
+        'region': region,
+        'coordinates': coords,
+        'plot_request': plot_request,
+        'needs_web_search': needs_web_search,
+        'needs_analysis': needs_analysis,
+        'needs_rag': needs_rag
+    }
     
     def parse_coordinates(self, text: str) -> Optional[Tuple[float, float]]:
         """Parse coordinates from text"""
@@ -1107,7 +1294,16 @@ Real ARGO data provides critical cyclone prediction capabilities through ocean t
             
             # Handle plot requests
             if query_info['plot_request']:
-                return self.generate_plot(query_info['plot_request'])
+                filters = {}
+                if query_info['platform_number']:
+                    filters['platform_number'] = query_info['platform_number']
+                if query_info['region']:
+                    filters['region'] = query_info['region']
+                if query_info['date']:
+                    filters['date'] = query_info['date']
+                
+                plot_result = self.generate_plot(query_info['plot_request'], filters)
+                return plot_result  # Return dict for image response
             
             # Handle satellite imagery
             if query_info['type'] == 'satellite':
@@ -1116,6 +1312,9 @@ Real ARGO data provides critical cyclone prediction capabilities through ocean t
                     return self.get_satellite_image(lat, lon, query_info['date'])
                 else:
                     return "Please provide coordinates for satellite imagery (e.g., 'show satellite image at 20.5, -80.3')."
+            
+            # ... rest of the existing chat method remains the same ...
+            # (Continue with existing logic for text responses)
             
             # Prepare data context
             context_data = []
@@ -1193,13 +1392,12 @@ Real ARGO data provides critical cyclone prediction capabilities through ocean t
                    "• Temperature-salinity relationships\n"
                    "• Ocean warming trends\n"
                    "• Cyclone prediction using ocean data\n"
-                   "• Plotting: 'plot temperature vs depth' or similar\n"
+                   "• Plotting: 'plot temperature vs depth' or 'show salinity vs temperature graph'\n"
                    "• Specific platform data (e.g., 'platform 6902746 data')")
             
         except Exception as e:
             logger.error(f"Chat error: {e}")
             return f"Error processing question: {e}"
-    
     def get_data_summary(self) -> str:
         """Get enhanced dataset summary with real data statistics"""
         if self.df is None:
