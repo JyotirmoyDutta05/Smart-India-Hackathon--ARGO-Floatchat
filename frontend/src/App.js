@@ -108,22 +108,52 @@ const FloatChat = () => {
     setIsLoading(true);
 
     try {
-      const response = await fetch("/api/chat", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ question: currentInput })
-      });
+  const response = await fetch("/api/chat", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ question: currentInput })
+  });
 
-      const data = await response.json();
+  const data = await response.json();
+  
+  // Handle different response types (text, image, error)
+  let messageContent;
+  let messageType = "text";
+  
+  if (data.type === "image") {
+    // Handle image/graph response
+    messageContent = (
+      <div className="graph-container">
+        <img 
+          src={data.url || `data:image/png;base64,${data.base64}`} 
+          alt={data.description || "Graph"} 
+          className="w-full rounded-lg border border-slate-600/50 shadow-lg"
+        />
+        <div className="mt-2 text-sm text-slate-300">
+          {data.description} ({data.data_points} data points)
+        </div>
+      </div>
+    );
+    messageType = "image";
+  } else {
+    // Handle text response
+    messageContent = data.content || data.response || "⚠️ No response from backend.";
+  }
 
-      const assistantMessage = {
-        id: Date.now() + 1,
-        type: "assistant",
-        content: data.response || "⚠️ No response from backend.",
-        timestamp: new Date()
-      };
+  const assistantMessage = {
+    id: Date.now() + 1,
+    type: "assistant",
+    content: messageContent,
+    contentType: messageType,
+    timestamp: new Date()
+  };
 
-      setMessages(prev => [...prev, assistantMessage]);
+  setMessages(prev => [...prev, assistantMessage]);
+      
+      // If it was a graph request, log success
+      if (messageType === "image") {
+        console.log("Graph displayed successfully");
+      }
     } catch (error) {
       const errorMessage = {
         id: Date.now() + 1,
@@ -140,9 +170,13 @@ const FloatChat = () => {
   const quickActions = [
     'Show current Indian Ocean temperature data',
     'Display active ARGO floats near India',
+    'Show salinity vs temperature graph',
+    'Show temperature vs depth graph',
+    'Show salinity vs depth graph',
+    'Show pressure vs time graph',
+    'Show pH vs salinity graph',
     'Analyze salinity trends in monsoon regions',
-    'Find temperature anomalies in the Bay of Bengal',
-    'Compare current vs historical ocean data'
+    'Find temperature anomalies in the Bay of Bengal'
   ];
 
   return (
@@ -275,6 +309,23 @@ const FloatChat = () => {
               <MapPin className="w-4 h-4" />
               <span className="hidden sm:inline">Indian Ocean</span>
             </button>
+            <div className="relative group">
+              <button 
+                className="px-4 py-2 bg-gradient-to-r from-cyan-500 to-blue-500 hover:from-cyan-600 hover:to-blue-600 rounded-lg transition-all duration-200 flex items-center space-x-2"
+              >
+                <Activity className="w-4 h-4" />
+                <span className="hidden sm:inline">Generate Graph</span>
+              </button>
+              <div className="absolute left-0 mt-2 w-56 rounded-md shadow-lg bg-slate-800 ring-1 ring-black ring-opacity-5 focus:outline-none z-10 hidden group-hover:block">
+                <div className="py-1" role="menu" aria-orientation="vertical">
+                  <button onClick={() => setInput('Show salinity vs temperature graph')} className="block px-4 py-2 text-sm text-white hover:bg-slate-700 w-full text-left" role="menuitem">Salinity vs Temperature</button>
+                  <button onClick={() => setInput('Show temperature vs depth graph')} className="block px-4 py-2 text-sm text-white hover:bg-slate-700 w-full text-left" role="menuitem">Temperature vs Depth</button>
+                  <button onClick={() => setInput('Show salinity vs depth graph')} className="block px-4 py-2 text-sm text-white hover:bg-slate-700 w-full text-left" role="menuitem">Salinity vs Depth</button>
+                  <button onClick={() => setInput('Show pressure vs time graph')} className="block px-4 py-2 text-sm text-white hover:bg-slate-700 w-full text-left" role="menuitem">Pressure vs Time</button>
+                  <button onClick={() => setInput('Show pH vs salinity graph')} className="block px-4 py-2 text-sm text-white hover:bg-slate-700 w-full text-left" role="menuitem">pH vs Salinity</button>
+                </div>
+              </div>
+            </div>
             <button className="p-2 hover:bg-slate-700/50 rounded-lg transition-colors">
               <RefreshCw className="w-4 h-4" />
             </button>
@@ -296,8 +347,13 @@ const FloatChat = () => {
                     </div>
                   )}
                   <div className="flex-1">
-                    <p className="leading-relaxed">{message.content}</p>
-                    <div className="flex items-center justify-between mt-3 pt-2 border-t border-slate-600/30">
+  {/* Render content based on contentType */}
+  {message.contentType === 'image' ? (
+    <div className="message-content">{message.content}</div>
+  ) : (
+    <p className="leading-relaxed">{message.content}</p>
+  )}
+  <div className="flex items-center justify-between mt-3 pt-2 border-t border-slate-600/30">
                       <span className="text-xs text-slate-400">
                         {message.timestamp.toLocaleTimeString()}
                       </span>
