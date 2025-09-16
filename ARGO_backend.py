@@ -598,26 +598,37 @@ class Phi35Model:
             logger.error(f"Failed to load Phi-3.5 model: {e}")
             self.model = None
     
-    def generate_response(self, prompt: str, max_tokens: int = 512) -> str:
-        """Generate response using Phi-3.5 model"""
+    def generate_response(self, prompt: str, max_tokens: int = 400) -> str:
+        """Generate response using Phi-3.5 model with length limit and structured format"""
         if self.model is None:
             return "AI model not available. Using fallback response generation."
         
         try:
+            # Add instruction for concise, structured responses
             formatted_prompt = f"""<|user|>
-{prompt}<|end|>
+{prompt}
+
+Please provide a concise, well-structured response with clear sections and bullet points where appropriate. 
+Keep your answer focused and to the point. End with a brief conclusion.
+<|end|>
 <|assistant|>
 """
             
             response = self.model(
                 formatted_prompt,
-                max_tokens=max_tokens,
+                max_tokens=max_tokens,  # Reduced from 512 to 400
                 temperature=0.7,
                 top_p=0.9,
                 stop=["<|end|>", "<|user|>"]
             )
             
-            return response['choices'][0]['text'].strip()
+            response_text = response['choices'][0]['text'].strip()
+            
+            # Add a conclusion if not already present
+            if not any(marker in response_text.lower() for marker in ["in conclusion", "to conclude", "in summary", "to summarize"]):
+                response_text += "\n\n**In conclusion**, this analysis provides key insights based on the available ARGO data. For more detailed information, please ask specific follow-up questions."
+            
+            return response_text
             
         except Exception as e:
             logger.error(f"Model generation error: {e}")
@@ -820,7 +831,7 @@ Research Keywords: ARGO autonomous float, oceanography, hydrographic survey, CTD
                 logger.warning("Failed to create RAG vector store")
     
     def detect_plot_request(self, question: str) -> Optional[str]:
-        """Enhanced plot detection with more patterns"""
+        """Enhanced plot detection with more patterns and dynamic graph generation"""
         question_lower = question.lower()
     
         plot_keywords = {
@@ -843,8 +854,12 @@ Research Keywords: ARGO autonomous float, oceanography, hydrographic survey, CTD
         # Check for plot request indicators
         plot_indicators = ['plot', 'graph', 'chart', 'visualize', 'show', 'display', 'draw']
         has_plot_indicator = any(indicator in question_lower for indicator in plot_indicators)
+        
+        # Check for "vs" pattern which often indicates a comparison graph request
+        has_vs_pattern = 'vs' in question_lower or 'versus' in question_lower or 'against' in question_lower
     
-        if has_plot_indicator:
+        # First check for specific plot types
+        if has_plot_indicator or (has_vs_pattern and 'graph' in question_lower):
             for pattern, plot_type in plot_keywords.items():
                 if plot_type != 'general_plot' and re.search(pattern, question_lower):
                     return plot_type
@@ -858,6 +873,40 @@ Research Keywords: ARGO autonomous float, oceanography, hydrographic survey, CTD
                 return 'sal_depth'
             elif 'pressure' in question_lower and 'time' in question_lower:
                 return 'pressure_time'
+            
+            # Dynamic graph detection for any two oceanographic variables
+            # Look for patterns like "X vs Y graph" or "graph of X vs Y"
+            variables = {
+                'temperature': ['temperature', 'temp'],
+                'salinity': ['salinity', 'sal'],
+                'depth': ['depth', 'pressure', 'pres'],
+                'time': ['time', 'date', 'temporal']
+            }
+            
+            # Detect which variables are mentioned in the query
+            mentioned_vars = []
+            for var_name, var_terms in variables.items():
+                if any(term in question_lower for term in var_terms):
+                    mentioned_vars.append(var_name)
+            
+            # If we have at least two variables and a graph/vs indicator, suggest a plot
+            if len(mentioned_vars) >= 2 and (has_plot_indicator or has_vs_pattern):
+                # Prioritize common combinations
+                if 'temperature' in mentioned_vars and 'depth' in mentioned_vars:
+                    return 'temp_depth'
+                elif 'salinity' in mentioned_vars and 'temperature' in mentioned_vars:
+                    return 'sal_temp'
+                elif 'salinity' in mentioned_vars and 'depth' in mentioned_vars:
+                    return 'sal_depth'
+                elif 'time' in mentioned_vars:
+                    # Time is usually on x-axis, so pair with another variable
+                    other_var = next((v for v in mentioned_vars if v != 'time'), None)
+                    if other_var == 'depth' or other_var == 'pressure':
+                        return 'pressure_time'
+            
+            # If just "graph" is mentioned without specifics, default to temperature vs depth
+            if 'graph' in question_lower and not has_vs_pattern:
+                return 'temp_depth'
         
         return None
     
@@ -1009,27 +1058,28 @@ Research Keywords: ARGO autonomous float, oceanography, hydrographic survey, CTD
         
         context = "\n".join(context_parts)
         
-        # Create comprehensive prompt with RAG enhancement
+        # Create comprehensive prompt with RAG enhancement and structured format instructions
         prompt = f"""You are an expert oceanographer analyzing real ARGO float data with enhanced retrieval capabilities. 
-Provide a comprehensive, scientific answer using the provided context.
+Provide a concise, well-structured answer using the provided context.
 
 Question: {question}
 
 Available Context (including RAG-retrieved information):
 {context}
 
-Please provide a detailed, scientific explanation that:
-1. Directly answers the question
-2. Uses specific data from the real ARGO dataset
-3. Incorporates RAG-retrieved information when available
-4. Explains oceanographic concepts
-5. Discusses scientific implications
-6. Maintains scientific accuracy
+Please provide a structured scientific explanation that:
+1. Starts with a brief summary answering the question directly (2-3 sentences)
+2. Uses specific data from the ARGO dataset in a "Key Data Points" section with bullet points
+3. Explains relevant oceanographic concepts in a "Scientific Context" section
+4. Ends with a brief "Conclusion" section (2-3 sentences)
+
+Format your response with clear headings and keep the total length concise (maximum 400 words).
+Use bullet points for lists and data points to improve readability.
 
 Response:"""
         
-        # Generate AI response
-        ai_response = self.ai_model.generate_response(prompt, max_tokens=800)
+        # Generate AI response with reduced token limit
+        ai_response = self.ai_model.generate_response(prompt, max_tokens=600)
         
         # Fallback if AI model fails
         if "AI model not available" in ai_response or "Error generating" in ai_response:
@@ -1049,51 +1099,74 @@ Response:"""
         if rag_results:
             for doc_content, doc_metadata in rag_results[:1]:
                 if 'platform_number' in doc_metadata:
-                    rag_info += f"\nRAG Context: Platform {doc_metadata['platform_number']} shows temperature {doc_metadata.get('temperature', 'N/A')}°C and salinity {doc_metadata.get('salinity', 'N/A')} PSU."
+                    rag_info += f"\n\n**Related Data:**\nPlatform {doc_metadata['platform_number']} shows temperature {doc_metadata.get('temperature', 'N/A')}°C and salinity {doc_metadata.get('salinity', 'N/A')} PSU."
         
         if "salinity" in question_lower and "temperature" in question_lower:
             if analysis_data and analysis_data['type'] == 'salinity_temperature' and 'error' not in analysis_data:
                 corr = analysis_data['correlation']
-                return f"""Based on real ARGO dataset analysis:
+                return f"""## Salinity-Temperature Analysis
 
-**Salinity-Temperature Relationship:**
+**Summary:**
+Analysis of ARGO float data reveals insights about the relationship between ocean salinity and temperature.
+
+**Key Findings:**
 - Correlation coefficient: {corr:.3f}
 - Data points analyzed: {analysis_data['data_points']}
 - Average temperature: {analysis_data['temperature_stats']['mean']:.2f}°C
 - Average salinity: {analysis_data['salinity_stats']['mean']:.2f} PSU
 
-The correlation indicates a {'strong positive' if corr > 0.7 else 'moderate positive' if corr > 0.3 else 'weak'} relationship between salinity and temperature in this real dataset.{rag_info}"""
+**Interpretation:**
+The correlation indicates a {'strong positive' if corr > 0.7 else 'moderate positive' if corr > 0.3 else 'weak'} relationship between salinity and temperature in this dataset.{rag_info}
+
+**Conclusion:**
+This analysis provides valuable insights into ocean thermodynamics. For more detailed information, please ask specific follow-up questions."""
         
         elif "warming" in question_lower or "trend" in question_lower:
             if analysis_data and analysis_data['type'] == 'ocean_warming' and 'error' not in analysis_data:
                 trend = analysis_data['warming_trend']
-                return f"""Based on real ARGO temporal analysis:
+                return f"""## Ocean Temperature Trend Analysis
 
-**Ocean Temperature Trends:**
+**Summary:**
+Analysis of ARGO temporal data reveals important trends in ocean temperature patterns.
+
+**Key Findings:**
 - Temperature trend: {trend:.4f}°C per year
 - Average temperature: {analysis_data['avg_temperature']:.2f}°C
 - Data points: {analysis_data['data_points']}
 - Trend shows {'warming' if trend > 0 else 'cooling' if trend < 0 else 'stable'} pattern
 
-This analysis from real ARGO data provides insights into regional temperature changes.{rag_info}"""
+**Interpretation:**
+This analysis provides insights into regional temperature changes over time.{rag_info}
+
+**Conclusion:**
+Understanding these temperature trends is crucial for climate research. For more detailed analysis, please ask specific follow-up questions."""
         
         elif "cyclone" in question_lower:
             if analysis_data and analysis_data['type'] == 'cyclone_prediction' and 'error' not in analysis_data:
                 warm_pct = analysis_data['warm_water_percentage']
-                return f"""Based on real ARGO data for cyclone analysis:
+                return f"""## Cyclone Formation Analysis
 
-**Cyclone Formation Conditions:**
+**Summary:**
+ARGO data provides critical insights into ocean conditions that influence cyclone formation.
+
+**Key Findings:**
 - Warm water (>26.5°C) coverage: {warm_pct:.1f}%
 - Surface data points: {analysis_data['surface_data_points']}
 - Warm water locations: {analysis_data['warm_water_points']}
 
-Real ARGO data provides critical cyclone prediction capabilities through ocean temperature monitoring.{rag_info}"""
+**Interpretation:**
+Ocean temperature monitoring is essential for cyclone prediction capabilities.{rag_info}
+
+**Conclusion:**
+This analysis helps identify regions with conditions favorable for cyclone development. For more detailed information, please ask specific follow-up questions."""
         
         else:
-            response_parts = ["Based on real ARGO float dataset:\n"]
+            response_parts = ["## ARGO Float Data Analysis\n"]
+            
+            response_parts.append("**Summary:**\nHere's what we found in the ARGO dataset related to your query.\n")
             
             if rag_results:
-                response_parts.append("RAG-Enhanced Context:")
+                response_parts.append("**Retrieved Context:**")
                 for doc_content, doc_metadata in rag_results[:2]:
                     if 'platform_number' in doc_metadata:
                         temp = doc_metadata.get('temperature', 'N/A')
@@ -1101,7 +1174,7 @@ Real ARGO data provides critical cyclone prediction capabilities through ocean t
                         response_parts.append(f"• Platform {doc_metadata['platform_number']}: {temp}°C, {sal} PSU")
             
             if context_data:
-                response_parts.append("Current measurements:")
+                response_parts.append("\n**Current Measurements:**")
                 for data in context_data[:3]:
                     platform = data.get('platform_number', 'Unknown')
                     temp = data.get('temperature', 'N/A')
@@ -1109,7 +1182,9 @@ Real ARGO data provides critical cyclone prediction capabilities through ocean t
                     response_parts.append(f"• Platform {platform}: {temp}°C, {sal} PSU")
             
             if web_results:
-                response_parts.append(f"\nAdditional information: {web_results[0]['snippet'][:200]}...")
+                response_parts.append(f"\n**Additional Information:**\n{web_results[0]['snippet'][:150]}...")
+            
+            response_parts.append("\n**Conclusion:**\nThis represents the available data from the ARGO float network. For more specific analysis, please refine your query.")
             
             return "\n".join(response_parts)
     
@@ -1285,14 +1360,14 @@ Real ARGO data provides critical cyclone prediction capabilities through ocean t
             return f"Error generating satellite image: {e}"
     
     def chat(self, question: str) -> str:
-        """Enhanced chat interface with plotting, real dataset, and GPU-accelerated RAG"""
+        """Enhanced chat interface with dynamic plotting, real dataset, and GPU-accelerated RAG"""
         try:
             logger.info(f"Processing: {question[:50]}...")
             
             # Analyze the query
             query_info = self.analyze_query(question)
             
-            # Handle plot requests
+            # Handle plot requests - now with enhanced detection
             if query_info['plot_request']:
                 filters = {}
                 if query_info['platform_number']:
@@ -1302,7 +1377,28 @@ Real ARGO data provides critical cyclone prediction capabilities through ocean t
                 if query_info['date']:
                     filters['date'] = query_info['date']
                 
+                # Extract coordinates for potential geographic filtering
+                if query_info['coordinates']:
+                    lat, lon = query_info['coordinates']
+                    # Add approximate geographic filtering (within 5 degrees)
+                    filters['latitude'] = (lat - 5, lat + 5)
+                    filters['longitude'] = (lon - 5, lon + 5)
+                
+                # Generate the requested plot
                 plot_result = self.generate_plot(query_info['plot_request'], filters)
+                
+                # Add explanatory text to the plot result
+                if 'type' not in plot_result or plot_result['type'] != 'error':
+                    plot_type_desc = {
+                        'temp_depth': 'Temperature vs Depth',
+                        'sal_temp': 'Salinity vs Temperature',
+                        'sal_depth': 'Salinity vs Depth',
+                        'pressure_time': 'Pressure vs Time'
+                    }.get(query_info['plot_request'], 'Requested')
+                    
+                    plot_result['explanation'] = f"Here's the {plot_type_desc} graph based on your query. " + \
+                                               f"The graph shows {plot_result.get('data_points', 'multiple')} data points from the ARGO dataset."
+                
                 return plot_result  # Return dict for image response
             
             # Handle satellite imagery
