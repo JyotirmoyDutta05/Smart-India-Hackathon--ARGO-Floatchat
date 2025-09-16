@@ -1,8 +1,0 @@
-{
-  "dependencies": {
-    "install": "^0.13.0",
-    "lucide-react": "^0.543.0",
-    "npm": "^11.6.0",
-    "recharts": "^3.2.0"
-  }
-}
