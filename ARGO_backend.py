@@ -1069,12 +1069,14 @@ Available Context (including RAG-retrieved information):
 
 Please provide a structured scientific explanation that:
 1. Starts with a brief summary answering the question directly (2-3 sentences)
-2. Uses specific data from the ARGO dataset in a "Key Data Points" section with bullet points
-3. Explains relevant oceanographic concepts in a "Scientific Context" section
-4. Ends with a brief "Conclusion" section (2-3 sentences)
+2. Format each point exactly like this: "1. The point content..." (with a period after the number)
+3. Do NOT add any horizontal lines or separators between points
+4. Leave exactly one blank line between each numbered point
+5. Explains relevant oceanographic concepts in a clear, numbered format
+6. Ends with a numbered conclusion point
 
-Format your response with clear headings and keep the total length concise (maximum 400 words).
-Use bullet points for lists and data points to improve readability.
+Format your response with clean numbered points and keep the total length concise (maximum 400 words).
+Use numbered points throughout the entire response instead of bullet points.
 
 Response:"""
         
@@ -1107,19 +1109,22 @@ Response:"""
                 return f"""## Salinity-Temperature Analysis
 
 **Summary:**
-Analysis of ARGO float data reveals insights about the relationship between ocean salinity and temperature.
+1. Analysis of ARGO float data reveals insights about the relationship between ocean salinity and temperature.
 
 **Key Findings:**
-- Correlation coefficient: {corr:.3f}
-- Data points analyzed: {analysis_data['data_points']}
-- Average temperature: {analysis_data['temperature_stats']['mean']:.2f}°C
-- Average salinity: {analysis_data['salinity_stats']['mean']:.2f} PSU
+2. Correlation coefficient: {corr:.3f}
+
+3. Data points analyzed: {analysis_data['data_points']}
+
+4. Average temperature: {analysis_data['temperature_stats']['mean']:.2f}°C
+
+5. Average salinity: {analysis_data['salinity_stats']['mean']:.2f} PSU
 
 **Interpretation:**
-The correlation indicates a {'strong positive' if corr > 0.7 else 'moderate positive' if corr > 0.3 else 'weak'} relationship between salinity and temperature in this dataset.{rag_info}
+6. The correlation indicates a {'strong positive' if corr > 0.7 else 'moderate positive' if corr > 0.3 else 'weak'} relationship between salinity and temperature in this dataset.{rag_info}
 
 **Conclusion:**
-This analysis provides valuable insights into ocean thermodynamics. For more detailed information, please ask specific follow-up questions."""
+7. This analysis provides valuable insights into ocean thermodynamics. For more detailed information, please ask specific follow-up questions."""
         
         elif "warming" in question_lower or "trend" in question_lower:
             if analysis_data and analysis_data['type'] == 'ocean_warming' and 'error' not in analysis_data:
@@ -1127,19 +1132,22 @@ This analysis provides valuable insights into ocean thermodynamics. For more det
                 return f"""## Ocean Temperature Trend Analysis
 
 **Summary:**
-Analysis of ARGO temporal data reveals important trends in ocean temperature patterns.
+1. Analysis of ARGO temporal data reveals important trends in ocean temperature patterns.
 
 **Key Findings:**
-- Temperature trend: {trend:.4f}°C per year
-- Average temperature: {analysis_data['avg_temperature']:.2f}°C
-- Data points: {analysis_data['data_points']}
-- Trend shows {'warming' if trend > 0 else 'cooling' if trend < 0 else 'stable'} pattern
+2. Temperature trend: {trend:.4f}°C per year
+
+3. Average temperature: {analysis_data['avg_temperature']:.2f}°C
+
+4. Data points: {analysis_data['data_points']}
+
+5. Trend shows {'warming' if trend > 0 else 'cooling' if trend < 0 else 'stable'} pattern
 
 **Interpretation:**
-This analysis provides insights into regional temperature changes over time.{rag_info}
+6. This analysis provides insights into regional temperature changes over time.{rag_info}
 
 **Conclusion:**
-Understanding these temperature trends is crucial for climate research. For more detailed analysis, please ask specific follow-up questions."""
+7. Understanding these temperature trends is crucial for climate research. For more detailed analysis, please ask specific follow-up questions."""
         
         elif "cyclone" in question_lower:
             if analysis_data and analysis_data['type'] == 'cyclone_prediction' and 'error' not in analysis_data:
@@ -1147,31 +1155,37 @@ Understanding these temperature trends is crucial for climate research. For more
                 return f"""## Cyclone Formation Analysis
 
 **Summary:**
-ARGO data provides critical insights into ocean conditions that influence cyclone formation.
+1. ARGO data provides critical insights into ocean conditions that influence cyclone formation.
 
 **Key Findings:**
-- Warm water (>26.5°C) coverage: {warm_pct:.1f}%
-- Surface data points: {analysis_data['surface_data_points']}
-- Warm water locations: {analysis_data['warm_water_points']}
+2. Warm water (>26.5°C) coverage: {warm_pct:.1f}%
+
+3. Surface data points: {analysis_data['surface_data_points']}
+
+4. Warm water locations: {analysis_data['warm_water_points']}
 
 **Interpretation:**
-Ocean temperature monitoring is essential for cyclone prediction capabilities.{rag_info}
+5. Ocean temperature monitoring is essential for cyclone prediction capabilities.{rag_info}
 
 **Conclusion:**
-This analysis helps identify regions with conditions favorable for cyclone development. For more detailed information, please ask specific follow-up questions."""
+6. This analysis helps identify regions with conditions favorable for cyclone development. For more detailed information, please ask specific follow-up questions."""
         
         else:
             response_parts = ["## ARGO Float Data Analysis\n"]
             
-            response_parts.append("**Summary:**\nHere's what we found in the ARGO dataset related to your query.\n")
+            response_parts.append("**Summary:**\n1. Here's what we found in the ARGO dataset related to your query.\n")
             
             if rag_results:
                 response_parts.append("**Retrieved Context:**")
+                count = 2
                 for doc_content, doc_metadata in rag_results[:2]:
                     if 'platform_number' in doc_metadata:
                         temp = doc_metadata.get('temperature', 'N/A')
                         sal = doc_metadata.get('salinity', 'N/A')
-                        response_parts.append(f"• Platform {doc_metadata['platform_number']}: {temp}°C, {sal} PSU")
+                        response_parts.append(f"{count}. Platform {doc_metadata['platform_number']}: {temp}°C, {sal} PSU")
+                        count += 1
+                        if count <= 3:  # Add blank line between points
+                            response_parts.append("")
             
             if context_data:
                 response_parts.append("\n**Current Measurements:**")
@@ -1179,12 +1193,17 @@ This analysis helps identify regions with conditions favorable for cyclone devel
                     platform = data.get('platform_number', 'Unknown')
                     temp = data.get('temperature', 'N/A')
                     sal = data.get('salinity', 'N/A')
-                    response_parts.append(f"• Platform {platform}: {temp}°C, {sal} PSU")
+                    response_parts.append(f"{count}. Platform {platform}: {temp}°C, {sal} PSU")
+                    count += 1
+                    if count <= len(context_data[:3]) + (2 if rag_results else 1):  # Add blank line between points
+                        response_parts.append("")
             
             if web_results:
-                response_parts.append(f"\n**Additional Information:**\n{web_results[0]['snippet'][:150]}...")
+                response_parts.append(f"\n**Additional Information:**\n{count}. {web_results[0]['snippet'][:150]}...")
+                count += 1
+                response_parts.append("")
             
-            response_parts.append("\n**Conclusion:**\nThis represents the available data from the ARGO float network. For more specific analysis, please refine your query.")
+            response_parts.append(f"\n**Conclusion:**\n{count}. This represents the available data from the ARGO float network. For more specific analysis, please refine your query.")
             
             return "\n".join(response_parts)
     
